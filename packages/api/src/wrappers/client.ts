@@ -1,14 +1,16 @@
-import { createClient as createGeneratedClient } from '../generated/client';
+import {
+  createClient as createGeneratedClient,
+  mergeHeaders,
+} from '../generated/client';
 import type { Client } from '../generated/client';
-import { ApiVersion } from '../generated/types.gen';
+import type { ApiVersion } from '../generated/types.gen';
 import { ApiError } from './errors';
 import { createRetryingFetch, createTimeoutFetch } from './transport';
 import type { RetryPolicy } from './transport';
 
 export type { ApiVersion };
 
-// Not `.at(-1)`: this runs at import, and JavaScriptCore before iOS 15.4 lacks it.
-export const API_VERSION: ApiVersion = Object.values(ApiVersion).pop()!;
+export const API_VERSION = '2026-10-08.v1' satisfies ApiVersion;
 
 export type UserTokenProvider = {
   getAccessToken: () => Promise<string>;
@@ -20,6 +22,12 @@ export type ApiClientConfig = {
   apiVersion?: ApiVersion;
   baseUrl: string;
   fetch?: typeof fetch;
+  /**
+   * Sent as `gt-project-id` only to the header-targeted plugin operations
+   * (`pluginInfo`, `pluginEnqueue`, …), which an organization API key needs;
+   * a per-call `gt-project-id` header wins. Project-scoped operations take
+   * `path.projectId`.
+   */
   projectId?: string;
   retryPolicy?: RetryPolicy;
   /** Set to false when a custom fetch implementation owns request timeouts. */
@@ -52,12 +60,45 @@ function createUserTokenFetch(
   };
 }
 
+/**
+ * The `gt-api-version` a client sends. Generated operations that require the
+ * header take it per call, and per-call headers override the client's, so
+ * passing this keeps `ApiClientConfig.apiVersion` in effect.
+ */
+export function getClientApiVersion(client: Client): ApiVersion {
+  const apiVersion = mergeHeaders(client.getConfig().headers).get(
+    'gt-api-version'
+  );
+  // createApiClient only ever sets an ApiVersion here.
+  return (apiVersion ?? API_VERSION) as ApiVersion;
+}
+
 export function createApiClient(config: ApiClientConfig): Client {
-  const headers = new Headers({
-    'gt-api-version': config.apiVersion ?? API_VERSION,
-  });
+  const client = createTransportClient(
+    config,
+    new Headers({ 'gt-api-version': config.apiVersion ?? API_VERSION })
+  );
+  const { projectId } = config;
+  if (projectId) {
+    client.interceptors.request.use((request) => {
+      if (
+        new URL(request.url).pathname.includes('/v1/integrations/plugins/') &&
+        !request.headers.has('gt-project-id')
+      ) {
+        request.headers.set('gt-project-id', projectId);
+      }
+      return request;
+    });
+  }
+  return client;
+}
+
+/** The generated client with auth, retry, timeout, and user-token refresh; shared with the legacy client. */
+export function createTransportClient(
+  config: Omit<ApiClientConfig, 'apiVersion' | 'projectId'>,
+  headers: Headers
+): Client {
   if (config.apiKey) headers.set('Authorization', `Bearer ${config.apiKey}`);
-  if (config.projectId) headers.set('gt-project-id', config.projectId);
 
   const transportFetch = createRetryingFetch({
     // Timeout applies per attempt, inside the retry loop.

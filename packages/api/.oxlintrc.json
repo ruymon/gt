@@ -6,5 +6,5 @@
     "node": true,
     "shared-node-browser": true
   },
-  "ignorePatterns": ["src/generated/"]
+  "ignorePatterns": ["src/generated/", "src/legacy/generated/"]
 }

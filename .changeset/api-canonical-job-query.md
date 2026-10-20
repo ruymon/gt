@@ -1,0 +1,7 @@
+---
+'@generaltranslation/api': minor
+---
+
+Move the SDK to the canonical API: `API_VERSION` is pinned to `2026-10-08.v1`, `createApiClient` no longer sends `gt-project-id` on canonical operations, which take `path.projectId` (it still sends `projectId` as `gt-project-id` to the header-targeted plugin operations such as `pluginInfo` and `pluginEnqueue`, which an organization API key needs; a per-call header wins), and the bundled SDK exposes the canonical operations (legacy ones such as `getTranslationJobInfo` and `getProjectInfo` are removed). `awaitJobs` now takes a `projectId` (`awaitJobs(client, projectId, jobIds, options)`) and polls `queryJobs` in batches of 100 through the new `queryJobsInBatches` helper; job results use the canonical `{ id, status, subject?, error? }` shape, `not_found` is terminal, and `unknown` only marks jobs not polled before the deadline.
+
+Add an internal `@generaltranslation/api/legacy` subpath for `generaltranslation`'s deprecated methods: a client generated from a frozen copy of the `2026-03-06.v1` spec (`spec/openapi.2026-03-06.v1.json`), `LEGACY_API_VERSION`, `createLegacyApiClient` (sends `gt-api-version: 2026-03-06.v1` and `gt-project-id`, on the same retry, timeout, and user-token transport), and the previous `awaitJobs(client, jobIds, options)` / `pollJobs` on `getTranslationJobInfo`. It is not part of the public API and is removed in the next major.

@@ -6,7 +6,7 @@ import { createBatches, processBatches } from '../wrappers/batch';
 import { API_VERSION, createApiClient } from '../wrappers/client';
 import { ApiError } from '../wrappers/errors';
 import { paginate } from '../wrappers/paginate';
-import { listProjects } from '../generated/sdk.gen';
+import { listProjects, pluginInfo } from '../generated/sdk.gen';
 import { createRetryingFetch, createTimeoutFetch } from '../wrappers/transport';
 
 afterEach(() => {
@@ -273,13 +273,8 @@ describe('API_VERSION', () => {
   ) as { components: { schemas: { ApiVersion: { enum: string[] } } } };
   const specVersions = spec.components.schemas.ApiVersion.enum;
 
-  it('relies on the bundled spec listing ApiVersion oldest to newest', () => {
-    // Date-prefixed versions sort lexically in release order.
-    expect(specVersions).toEqual([...specVersions].sort());
-  });
-
-  it('is the newest ApiVersion in the bundled spec', () => {
-    expect(API_VERSION).toBe(specVersions.at(-1));
+  it("is one of the bundled spec's ApiVersion values", () => {
+    expect(specVersions).toContain(API_VERSION);
   });
 });
 
@@ -306,8 +301,48 @@ describe('createApiClient', () => {
 
     expect(request?.url).toBe('https://example.com/test');
     expect(request?.headers.get('Authorization')).toBe('Bearer api-key');
-    expect(request?.headers.get('gt-project-id')).toBe('project-id');
+    expect(request?.headers.has('gt-project-id')).toBe(false);
     expect(request?.headers.get('gt-api-version')).toBe(API_VERSION);
+  });
+
+  it('sends the configured gt-project-id to header-targeted plugin operations only', async () => {
+    const requests: Request[] = [];
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        requests.push(new Request(input));
+        return new Response('{}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    const client = createApiClient({
+      apiKey: 'org-api-key',
+      baseUrl: 'https://example.com',
+      fetch: fetchMock,
+      projectId: 'project-id',
+    });
+    const options = {
+      body: { fileName: 'design.fig' },
+      client,
+      path: { provider: 'figma' as const },
+    };
+
+    await pluginInfo(options);
+    await pluginInfo({
+      ...options,
+      headers: { 'gt-project-id': 'other-project-id' },
+    });
+    await listProjects({ client });
+
+    expect(new URL(requests[0].url).pathname).toBe(
+      '/v1/integrations/plugins/figma/info'
+    );
+    expect(requests[0].headers.get('gt-project-id')).toBe('project-id');
+    expect(requests[0].headers.get('gt-api-version')).toBe(API_VERSION);
+    expect(requests[1].headers.get('gt-project-id')).toBe('other-project-id');
+    expect(new URL(requests[2].url).pathname).toBe('/v2/projects');
+    expect(requests[2].headers.has('gt-project-id')).toBe(false);
   });
 
   it('uses a user token when no explicit API key is configured', async () => {
@@ -616,30 +651,148 @@ describe('batch helpers', () => {
 });
 
 describe('awaitJobs', () => {
-  it('polls the jobs endpoint through a configured client', async () => {
-    let request: Request | undefined;
+  type JobsQuery = { jobs: Array<{ id: string }> };
+
+  function createJobsClient(
+    getResults: (ids: string[]) => Array<{ id: string; status: string }>,
+    config: { apiVersion?: '2026-03-06.v1' } = {}
+  ) {
+    const requests: Request[] = [];
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockImplementation(async (input) => {
-        request = new Request(input);
-        return new Response(
-          JSON.stringify([{ jobId: 'one', status: 'completed' }]),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+        const request = new Request(input);
+        requests.push(request);
+        const body = (await request.clone().json()) as JobsQuery;
+        return Response.json({
+          results: getResults(body.jobs.map(({ id }) => id)),
+        });
       });
     const client = createApiClient({
+      ...config,
       baseUrl: 'https://example.com',
       fetch: fetchMock,
+      projectId: 'project-id',
       retryPolicy: 'none',
     });
+    const readBodies = () =>
+      Promise.all(
+        requests.map(
+          async (request) => (await request.clone().json()) as JobsQuery
+        )
+      );
+    return { client, readBodies, requests };
+  }
 
-    const result = await awaitJobs(client, ['one']);
+  it('polls queryJobs for the project through a configured client', async () => {
+    const { client, readBodies, requests } = createJobsClient((ids) =>
+      ids.map((id) => ({ id, status: 'completed' }))
+    );
+
+    const result = await awaitJobs(client, 'project-id', ['one']);
 
     expect(result).toEqual({
       complete: true,
-      jobs: [{ jobId: 'one', status: 'completed' }],
+      jobs: [{ id: 'one', status: 'completed' }],
     });
-    expect(request?.url).toBe('https://example.com/v2/project/jobs/info');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toBe(
+      'https://example.com/v2/projects/project-id/jobs/query'
+    );
+    expect(requests[0].method).toBe('POST');
+    expect(requests[0].headers.get('gt-api-version')).toBe(API_VERSION);
+    expect(requests[0].headers.has('gt-project-id')).toBe(false);
+    expect(await readBodies()).toEqual([{ jobs: [{ id: 'one' }] }]);
+  });
+
+  it("keeps the client's configured API version", async () => {
+    const { client, requests } = createJobsClient(
+      (ids) => ids.map((id) => ({ id, status: 'completed' })),
+      { apiVersion: '2026-03-06.v1' }
+    );
+
+    await awaitJobs(client, 'project-id', ['one']);
+
+    expect(requests[0].headers.get('gt-api-version')).toBe('2026-03-06.v1');
+  });
+
+  it('queries more than 100 jobs in batches of 100, in order', async () => {
+    const jobIds = Array.from({ length: 205 }, (_, index) => `job-${index}`);
+    const { client, readBodies } = createJobsClient((ids) =>
+      ids.map((id) => ({ id, status: 'completed' }))
+    );
+
+    const result = await awaitJobs(client, 'project-id', jobIds);
+
+    const bodies = await readBodies();
+    expect(bodies.map(({ jobs }) => jobs.length)).toEqual([100, 100, 5]);
+    expect(bodies.flatMap(({ jobs }) => jobs.map(({ id }) => id))).toEqual(
+      jobIds
+    );
+    expect(result.complete).toBe(true);
+    expect(result.jobs.map(({ id }) => id)).toEqual(jobIds);
+  });
+
+  it('sends each duplicated job ID once', async () => {
+    const { client, readBodies } = createJobsClient((ids) =>
+      ids.map((id) => ({ id, status: 'completed' }))
+    );
+
+    const result = await awaitJobs(client, 'project-id', ['one', 'one']);
+
+    expect(await readBodies()).toEqual([{ jobs: [{ id: 'one' }] }]);
+    expect(result.jobs).toEqual([{ id: 'one', status: 'completed' }]);
+  });
+
+  // The first batch of 100 answers; the second (job-100) answers with `failBatch`.
+  function createMixedBatchClient(
+    failBatch: (request: Request) => Promise<Response>
+  ) {
+    return createApiClient({
+      baseUrl: 'https://example.com',
+      fetch: async (input) => {
+        const request = new Request(input);
+        const { jobs } = (await request.clone().json()) as JobsQuery;
+        if (jobs.length < 100) return failBatch(request);
+        return Response.json({
+          results: jobs.map(({ id }) => ({ id, status: 'completed' })),
+        });
+      },
+      retryPolicy: 'none',
+    });
+  }
+  const jobIds101 = Array.from({ length: 101 }, (_, index) => `job-${index}`);
+
+  it('keeps the statuses of batches that loaded when another batch fails at the deadline', async () => {
+    const client = createMixedBatchClient(
+      (request) =>
+        new Promise((_, reject) => {
+          request.signal.addEventListener('abort', () =>
+            // Settle after the deadline, not on the timer's edge.
+            setTimeout(() => reject(request.signal.reason), 10)
+          );
+        })
+    );
+
+    const result = await awaitJobs(client, 'project-id', jobIds101, {
+      timeoutSeconds: 0.05,
+    });
+
+    expect(result.complete).toBe(false);
+    expect(result.jobs).toEqual([
+      ...jobIds101.slice(0, 100).map((id) => ({ id, status: 'completed' })),
+      { id: 'job-100', status: 'unknown' },
+    ]);
+  });
+
+  it('throws when a batch fails before the deadline', async () => {
+    const client = createMixedBatchClient(async () =>
+      Response.json({ error: 'boom' }, { status: 500 })
+    );
+
+    await expect(awaitJobs(client, 'project-id', jobIds101)).rejects.toThrow(
+      'boom'
+    );
   });
 });
 
@@ -647,8 +800,8 @@ describe('pollJobs', () => {
   it('polls pending jobs until they reach terminal states', async () => {
     const getJobStatuses = vi
       .fn()
-      .mockResolvedValueOnce([{ jobId: 'one', status: 'processing' }])
-      .mockResolvedValueOnce([{ jobId: 'one', status: 'completed' }]);
+      .mockResolvedValueOnce([{ id: 'one', status: 'processing' }])
+      .mockResolvedValueOnce([{ id: 'one', status: 'completed' }]);
 
     const result = await pollJobs(['one'], getJobStatuses, {
       pollingIntervalSeconds: 0,
@@ -656,7 +809,7 @@ describe('pollJobs', () => {
 
     expect(result).toEqual({
       complete: true,
-      jobs: [{ jobId: 'one', status: 'completed' }],
+      jobs: [{ id: 'one', status: 'completed' }],
     });
     expect(getJobStatuses).toHaveBeenCalledTimes(2);
   });
@@ -673,7 +826,7 @@ describe('pollJobs', () => {
       pollCount += 1;
       return [
         {
-          jobId: 'one',
+          id: 'one',
           status:
             pollCount === 1 ? ('processing' as const) : ('completed' as const),
         },
@@ -687,8 +840,8 @@ describe('pollJobs', () => {
   });
 
   it('reports each successful poll through the hook', async () => {
-    const processing = [{ jobId: 'one', status: 'processing' as const }];
-    const completed = [{ jobId: 'one', status: 'completed' as const }];
+    const processing = [{ id: 'one', status: 'processing' as const }];
+    const completed = [{ id: 'one', status: 'completed' as const }];
     const getJobStatuses = vi
       .fn()
       .mockResolvedValueOnce(processing)
@@ -703,7 +856,23 @@ describe('pollJobs', () => {
     expect(onPoll.mock.calls).toEqual([[processing], [completed]]);
   });
 
-  it('reports incomplete unknown jobs when the deadline expires', async () => {
+  it('treats not_found as terminal', async () => {
+    const getJobStatuses = vi
+      .fn()
+      .mockResolvedValue([{ id: 'one', status: 'not_found' }]);
+
+    const result = await pollJobs(['one'], getJobStatuses, {
+      pollingIntervalSeconds: 0,
+    });
+
+    expect(result).toEqual({
+      complete: true,
+      jobs: [{ id: 'one', status: 'not_found' }],
+    });
+    expect(getJobStatuses).toHaveBeenCalledOnce();
+  });
+
+  it('reports never-polled jobs as unknown when the deadline expires', async () => {
     const getJobStatuses = vi.fn();
 
     const result = await pollJobs(['one'], getJobStatuses, {
@@ -712,23 +881,19 @@ describe('pollJobs', () => {
 
     expect(result).toEqual({
       complete: false,
-      jobs: [{ jobId: 'one', status: 'unknown' }],
+      jobs: [{ id: 'one', status: 'unknown' }],
     });
     expect(getJobStatuses).not.toHaveBeenCalled();
   });
 
-  it('marks jobs missing from the response as unknown', async () => {
-    const getJobStatuses = vi.fn().mockResolvedValue([]);
+  it('throws when the response has no result for a requested job', async () => {
+    const getJobStatuses = vi
+      .fn()
+      .mockResolvedValue([{ id: 'one', status: 'completed' }]);
 
-    const result = await pollJobs(['one'], getJobStatuses, {
-      pollingIntervalSeconds: 0,
-    });
-
-    expect(result).toEqual({
-      complete: true,
-      jobs: [{ jobId: 'one', status: 'unknown' }],
-    });
-    expect(getJobStatuses).toHaveBeenCalledOnce();
+    await expect(
+      pollJobs(['one', 'two'], getJobStatuses, { pollingIntervalSeconds: 0 })
+    ).rejects.toThrow('Job status response has no result for job IDs: two');
   });
 
   it('propagates status-loader errors before the deadline', async () => {

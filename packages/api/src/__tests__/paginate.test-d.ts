@@ -1,11 +1,12 @@
 import { describe, expectTypeOf, it } from 'vitest';
 
 import type { Client } from '../generated/client';
-import { getProjectInfo, listOrgs, listProjects } from '../generated/sdk.gen';
+import { getProject, listOrgs, listProjects } from '../generated/sdk.gen';
 import type {
   ListOrgsResponse,
   ListProjectsResponse,
 } from '../generated/types.gen';
+import { API_VERSION } from '../wrappers/client';
 import { paginate } from '../wrappers/paginate';
 
 declare const client: Client;
@@ -21,7 +22,11 @@ describe('paginate', () => {
   });
 
   it('rejects operations that do not return a page', () => {
-    // @ts-expect-error getProjectInfo responses have no items or nextCursor
-    paginate(getProjectInfo, { client, path: { projectId: 'p' } });
+    // @ts-expect-error getProject responses have no items or nextCursor
+    paginate(getProject, {
+      client,
+      headers: { 'gt-api-version': API_VERSION },
+      path: { projectId: 'p' },
+    });
   });
 });

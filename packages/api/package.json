@@ -23,14 +23,24 @@
         "default": "./dist/index.mjs"
       }
     },
+    "./legacy": {
+      "require": {
+        "types": "./dist/legacy.d.cts",
+        "default": "./dist/legacy.cjs"
+      },
+      "import": {
+        "types": "./dist/legacy.d.mts",
+        "default": "./dist/legacy.mjs"
+      }
+    },
     "./spec/openapi.json": "./spec/openapi.json"
   },
   "scripts": {
     "build": "tsdown",
     "build:clean": "sh ../../scripts/clean.sh && pnpm run build",
     "build:release": "pnpm run build:clean",
-    "codegen": "openapi-ts && oxfmt src/generated spec/openapi.json",
-    "format": "oxfmt --check src openapi-ts.config.ts tsdown.config.mts package.json tsconfig.json spec/openapi.json",
+    "codegen": "openapi-ts && oxfmt src/generated src/legacy/generated spec/openapi.json spec/openapi.2026-03-06.v1.json",
+    "format": "oxfmt --check src openapi-ts.config.ts tsdown.config.mts package.json tsconfig.json spec/openapi.json spec/openapi.2026-03-06.v1.json",
     "lint": "oxlint src",
     "test": "vitest run --typecheck",
     "typecheck": "tsc --noEmit"
