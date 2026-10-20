@@ -1,5 +1,4 @@
-import type { GetFileInfoResponse } from 'generaltranslation/api';
-import type { FileToUpload } from 'generaltranslation/types';
+import type { FileDataResult, FileToUpload } from 'generaltranslation/types';
 import { logger } from '../../console/logger.js';
 import { recordWarning } from '../../state/translateWarnings.js';
 import {
@@ -152,7 +151,7 @@ export class UploadSourcesStep {
     // Build a map of branch:fileId:versionId to fileData
     const fileDataMap = new Map<
       string,
-      GetFileInfoResponse['sourceFiles'][number]
+      NonNullable<FileDataResult['sourceFiles']>[number]
     >();
     fileData.sourceFiles?.forEach((f) => {
       fileDataMap.set(`${f.branchId}:${f.fileId}:${f.versionId}`, f);

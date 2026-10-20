@@ -3,11 +3,11 @@ import {
   createTag,
   getProjectInfo,
   uploadAssets,
-} from '@generaltranslation/api';
+} from '@generaltranslation/api/legacy';
 import { GT } from '../index';
 
-vi.mock('@generaltranslation/api', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@generaltranslation/api')>()),
+vi.mock('@generaltranslation/api/legacy', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@generaltranslation/api/legacy')>()),
   createTag: vi.fn(),
   getProjectInfo: vi.fn(),
   uploadAssets: vi.fn(),

@@ -1,4 +1,4 @@
-import type { GetTranslationJobInfoResponse } from '@generaltranslation/api';
+import type { GetTranslationJobInfoResponse } from '@generaltranslation/api/legacy';
 
 // Compatibility result: published failed-job messages remain non-null while
 // the adapter normalizes the generated API's null message to an empty string.

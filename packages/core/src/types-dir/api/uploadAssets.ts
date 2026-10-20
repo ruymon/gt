@@ -1,4 +1,4 @@
-import type { UploadAssetsResponse } from '@generaltranslation/api';
+import type { UploadAssetsResponse } from '@generaltranslation/api/legacy';
 
 // Compatibility input: the published font shape intentionally omits the
 // generated API's optional family/style metadata.

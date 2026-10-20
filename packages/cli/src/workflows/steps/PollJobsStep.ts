@@ -1,5 +1,5 @@
 import chalk from 'chalk';
-import type { JobResult } from 'generaltranslation/api';
+import type { JobResult } from 'generaltranslation/types';
 import { logger } from '../../console/logger.js';
 import type { ApiClient } from '../../utils/api.js';
 import { EnqueueFilesResult } from 'generaltranslation/types';

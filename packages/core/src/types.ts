@@ -1,9 +1,9 @@
+import type { ApiClientConfig } from '@generaltranslation/api';
 import type {
-  ApiClientConfig,
   CreateTagData,
   CreateTagResponse,
   GetOrphanedFilesResponse,
-} from '@generaltranslation/api';
+} from '@generaltranslation/api/legacy';
 import type {
   CustomMapping as FormatCustomMapping,
   DataFormat as FormatDataFormat,
@@ -54,13 +54,22 @@ export type {
 export type { CheckFileTranslationsOptions } from './types-dir/api/checkFileTranslations';
 export type {
   DownloadFileBatchOptions,
+  DownloadFileBatchRequest,
   DownloadFileBatchResult,
 } from './types-dir/api/downloadFileBatch';
 export type { EnqueueFilesOptions } from './translate/enqueueFiles';
 export type { EnqueueFilesResult, Updates } from './types-dir/api/enqueueFiles';
 export type CreateTagOptions = CreateTagData['body'];
 export type CreateTagResult = CreateTagResponse;
-export type { SetupProjectFileReference } from './translate/setupProject';
+export type {
+  SetupProjectFileReference,
+  SetupProjectResult,
+} from './translate/setupProject';
+export type {
+  CreateBranchQuery,
+  CreateBranchResult,
+  LegacyCreateBranchQuery,
+} from './translate/createBranch';
 export type { FileToUpload } from './types-dir/api/file';
 export type { FileUpload } from './types-dir/api/uploadFiles';
 export type { FileReference } from './types-dir/api/file';

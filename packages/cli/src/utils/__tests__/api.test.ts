@@ -12,6 +12,13 @@ const uploadedFile = {
   locale: 'en',
 };
 
+function succeededBatch<T>(results: T[]) {
+  return {
+    summary: { total: results.length, succeeded: results.length, failed: 0 },
+    results: results.map((result) => ({ ...result, status: 'succeeded' })),
+  };
+}
+
 describe('CLI API client', () => {
   const fetchMock = vi.fn<typeof fetch>();
   const configure = (
@@ -48,17 +55,19 @@ describe('CLI API client', () => {
     });
     const bodies: Array<{ sourceLocale: string; targetLocale: string }> = [];
     fetchMock.mockImplementation(async (request) => {
-      expect(new URL(request.url).pathname).toBe('/v2/translate');
+      expect(new URL(request.url).pathname).toBe(
+        '/v2/projects/project-id/translate'
+      );
       expect(request.headers.get('authorization')).toBe('Bearer api-key');
-      expect(request.headers.get('gt-project-id')).toBe('project-id');
+      expect(request.headers.get('gt-project-id')).toBeNull();
       const body = JSON.parse(await request.text()) as {
         requests: Record<string, unknown>;
         sourceLocale: string;
         targetLocale: string;
       };
       bodies.push(body);
-      return Response.json(
-        Object.fromEntries(
+      return Response.json({
+        translations: Object.fromEntries(
           Object.keys(body.requests).map((hash) => [
             hash,
             {
@@ -68,8 +77,9 @@ describe('CLI API client', () => {
               dataFormat: 'STRING',
             },
           ])
-        )
-      );
+        ),
+        generated: true,
+      });
     });
 
     await expect(
@@ -366,7 +376,9 @@ describe('CLI API client', () => {
 
   it('publishes only contract fields for CDN entries', async () => {
     fetchMock.mockImplementation(async (request) => {
-      expect(new URL(request.url).pathname).toBe('/v2/project/files/publish');
+      expect(new URL(request.url).pathname).toBe(
+        '/v2/projects/project-id/files/publish'
+      );
       await expect(request.json()).resolves.toEqual({
         files: [
           {
@@ -377,7 +389,7 @@ describe('CLI API client', () => {
           },
         ],
       });
-      return Response.json({ results: [] });
+      return Response.json(succeededBatch([]));
     });
 
     const entries: PublishFileEntry[] = [
@@ -404,14 +416,8 @@ describe('CLI API client', () => {
         sourceLocale: string;
       };
       requestBodies.push(body);
-      return Response.json(
-        {
-          uploadedFiles: body.data.map(() => uploadedFile),
-          count: body.data.length,
-          message: 'uploaded',
-        },
-        { status: 201 }
-      );
+      const { locale: _locale, ...sourceResult } = uploadedFile;
+      return Response.json(succeededBatch(body.data.map(() => sourceResult)));
     });
 
     const result = await api.uploadSourceFiles(
@@ -459,10 +465,7 @@ describe('CLI API client', () => {
       };
       expect(body.data[0].source.content).toBe('c291cmNl');
       expect(body.data[0].translations[0].content).toBe('dHJhbnNsYXRpb24=');
-      return Response.json(
-        { uploadedFiles: [uploadedFile], count: 1, message: 'uploaded' },
-        { status: 201 }
-      );
+      return Response.json(succeededBatch([uploadedFile]));
     });
 
     const result = await api.uploadTranslations(
@@ -505,14 +508,10 @@ describe('CLI API client', () => {
         }>;
         sourceLocale: string;
       };
-      expect(body.sourceLocale).toBe('en-US');
+      expect(body.sourceLocale).toBeUndefined();
       expect(body.data[0].source.locale).toBe('en-US');
       expect(body.data[0].translations[0].locale).toBe('es-ES');
-      return Response.json({
-        uploadedFiles: [uploadedFile],
-        count: 1,
-        message: 'uploaded',
-      });
+      return Response.json(succeededBatch([uploadedFile]));
     });
 
     const files = [

@@ -1,7 +1,7 @@
 import type {
   ProcessFileMovesData,
   ProcessFileMovesResponse,
-} from '@generaltranslation/api';
+} from '@generaltranslation/api/legacy';
 
 export type MoveMapping = ProcessFileMovesData['body']['moves'][number];
 

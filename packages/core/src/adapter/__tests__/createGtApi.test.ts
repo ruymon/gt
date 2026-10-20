@@ -1,36 +1,64 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  API_VERSION,
+  ApiError,
+  createBranch,
   createProject,
   createProjectApiKey,
+  getProject,
+  listBranches,
+  listOrgs,
+  listProjects,
+  moveFiles,
+  overwriteTranslations,
+  publishFiles,
+  queryFiles,
+  queryFilesContent,
+  translateFiles,
+  uploadSourceFiles,
+  uploadTranslations,
+  upsertAssets,
+} from '@generaltranslation/api';
+import {
   downloadFiles,
   getFileInfo,
   getOrphanedFiles,
   getTranslationJobInfo,
-  listOrgs,
-  listProjects,
-  publishFiles,
+  LEGACY_API_VERSION,
   submitUserEditDiffs,
-  uploadTranslations,
-} from '@generaltranslation/api';
-import type {
-  PublishFilesData,
-  SubmitUserEditDiffsData,
-} from '@generaltranslation/api';
+  uploadAssets as legacyUploadAssets,
+} from '@generaltranslation/api/legacy';
+import type { SubmitUserEditDiffsData } from '@generaltranslation/api/legacy';
 import { createGtApiAdapter } from '../createGtApi';
 
 vi.mock('@generaltranslation/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@generaltranslation/api')>()),
+  createBranch: vi.fn(),
   createProject: vi.fn(),
   createProjectApiKey: vi.fn(),
+  getProject: vi.fn(),
+  listBranches: vi.fn(),
+  listOrgs: vi.fn(),
+  listProjects: vi.fn(),
+  moveFiles: vi.fn(),
+  overwriteTranslations: vi.fn(),
+  publishFiles: vi.fn(),
+  queryFiles: vi.fn(),
+  queryFilesContent: vi.fn(),
+  translateFiles: vi.fn(),
+  uploadSourceFiles: vi.fn(),
+  uploadTranslations: vi.fn(),
+  upsertAssets: vi.fn(),
+}));
+
+vi.mock('@generaltranslation/api/legacy', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@generaltranslation/api/legacy')>()),
   downloadFiles: vi.fn(),
   getFileInfo: vi.fn(),
   getOrphanedFiles: vi.fn(),
   getTranslationJobInfo: vi.fn(),
-  listOrgs: vi.fn(),
-  listProjects: vi.fn(),
-  publishFiles: vi.fn(),
   submitUserEditDiffs: vi.fn(),
-  uploadTranslations: vi.fn(),
+  uploadAssets: vi.fn(),
 }));
 
 function result<T>(data: T) {
@@ -41,10 +69,67 @@ function result<T>(data: T) {
   };
 }
 
+function failure(status: number) {
+  return {
+    data: undefined,
+    error: { error: `HTTP ${status}` },
+    request: new Request('https://api.example.com'),
+    response: new Response(null, { status }),
+  };
+}
+
+function succeeded<T>(results: T[]) {
+  return {
+    summary: { total: results.length, succeeded: results.length, failed: 0 },
+    results,
+  };
+}
+
+function bodyOf(mock: unknown, call = 0) {
+  return vi.mocked(mock as (options: { body: never }) => unknown).mock.calls[
+    call
+  ][0].body as Record<string, unknown[]>;
+}
+
 const customMapping = {
   source: { code: 'en-US' },
   target: { code: 'es-ES' },
 };
+
+const project = {
+  id: 'project-id',
+  name: 'Project',
+  orgId: 'org-id',
+  defaultLocale: 'en-US',
+  currentLocales: ['es-ES'],
+  autoApprove: false,
+  cdnEnabled: true,
+};
+
+const branch = { id: 'branch-id', name: 'main', isDefault: true };
+
+function configuredAdapter(fetch?: typeof globalThis.fetch) {
+  return createGtApiAdapter({
+    baseUrl: 'https://api.example.com',
+    projectId: 'project-id',
+    customMapping,
+    fetch,
+  });
+}
+
+// queryJobs is called inside @generaltranslation/api, so it is served over fetch.
+function jobsFetch(statusOf: (id: string) => Record<string, unknown>) {
+  const requests: { pathname: string; jobs: { id: string }[] }[] = [];
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const { jobs } = await request.json();
+    requests.push({ pathname: new URL(request.url).pathname, jobs });
+    return Response.json({
+      results: jobs.map(({ id }: { id: string }) => ({ id, ...statusOf(id) })),
+    });
+  };
+  return { fetch, requests };
+}
 
 describe.sequential('createGtApiAdapter', () => {
   beforeEach(() => {
@@ -74,7 +159,628 @@ describe.sequential('createGtApiAdapter', () => {
     expect(adapter.resolveAliasLocale('es-ES')).toBe('target');
   });
 
-  it('refreshes management requests and clears omitted locale mappings on reconfiguration', async () => {
+  it('sends canonical project-scoped requests without gt-project-id and refreshes them on reconfiguration', async () => {
+    const { createBranch: realCreateBranch } = await vi.importActual<
+      typeof import('@generaltranslation/api')
+    >('@generaltranslation/api');
+    vi.mocked(createBranch).mockImplementation(realCreateBranch as never);
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      Response.json({ branch }, { status: 201 })
+    );
+    const adapter = createGtApiAdapter({
+      baseUrl: 'https://api.example.com',
+      apiKey: 'old-key',
+      projectId: 'old-project',
+      customMapping,
+      fetch: fetchMock,
+    });
+    await adapter.createBranch({ name: 'main' });
+    expect(adapter.resolveAliasLocale('es-ES')).toBe('target');
+
+    adapter.configure({
+      baseUrl: 'https://reconfigured.example.com',
+      apiKey: 'new-key',
+      apiVersion: '2026-03-06.v1',
+      projectId: 'new-project',
+      fetch: fetchMock,
+    });
+    await adapter.createBranch({ name: 'main' });
+
+    const [first, second] = fetchMock.mock.calls.map(
+      ([input, init]) => new Request(input, init)
+    );
+    expect(new URL(first.url).pathname).toBe(
+      '/v2/projects/old-project/branches'
+    );
+    expect(first.headers.get('gt-api-version')).toBe(API_VERSION);
+    expect(first.headers.has('gt-project-id')).toBe(false);
+    expect(new URL(second.url).origin).toBe('https://reconfigured.example.com');
+    expect(new URL(second.url).pathname).toBe(
+      '/v2/projects/new-project/branches'
+    );
+    expect(second.headers.get('authorization')).toBe('Bearer new-key');
+    // The per-call header keeps a configured version override in effect.
+    expect(second.headers.get('gt-api-version')).toBe('2026-03-06.v1');
+    expect(second.headers.has('gt-project-id')).toBe(false);
+    expect(adapter.resolveAliasLocale('es-ES')).toBe('es-ES');
+  });
+
+  it('rethrows a createBranch conflict when no branch has the name', async () => {
+    vi.mocked(createBranch).mockResolvedValue(failure(409) as never);
+    vi.mocked(listBranches).mockResolvedValue(
+      result({ items: [], nextCursor: null })
+    );
+
+    await expect(
+      configuredAdapter().createBranch({ name: 'feature', isDefault: true })
+    ).rejects.toMatchObject({ code: 409 });
+  });
+
+  it('rethrows a createBranch conflict when the key cannot list branches', async () => {
+    vi.mocked(createBranch).mockResolvedValue(failure(409) as never);
+    vi.mocked(listBranches).mockRejectedValue(
+      new ApiError('forbidden', 403, 'forbidden')
+    );
+
+    await expect(
+      configuredAdapter().createBranch({ name: 'feature' })
+    ).rejects.toMatchObject({ code: 409 });
+  });
+
+  it('aliases the project locales from getProject', async () => {
+    vi.mocked(getProject).mockResolvedValue(result(project));
+    const adapter = configuredAdapter();
+
+    await expect(adapter.getProject()).resolves.toEqual({
+      ...project,
+      defaultLocale: 'source',
+      currentLocales: ['target'],
+    });
+  });
+
+  it.each([
+    ['source', 'target'],
+    ['en-us', 'es-es'],
+  ])(
+    'canonicalizes upload locales %s / %s and stops sending sourceLocale for translations',
+    async (sourceLocale, targetLocale) => {
+      const uploadedFile = {
+        branchId: 'branch-id',
+        fileId: 'file-id',
+        versionId: 'version-id',
+        fileName: 'document.html',
+        fileFormat: 'HTML' as const,
+        status: 'succeeded' as const,
+      };
+      vi.mocked(uploadTranslations).mockResolvedValue(
+        result(
+          succeeded([
+            { ...uploadedFile, locale: 'en-US' },
+            { ...uploadedFile, locale: 'es-ES' },
+          ])
+        )
+      );
+      const adapter = configuredAdapter();
+
+      const response = await adapter.uploadTranslations(
+        [
+          {
+            source: {
+              content: 'source',
+              fileName: 'document.html',
+              fileFormat: 'HTML',
+              locale: sourceLocale,
+            },
+            translations: [
+              {
+                content: 'translation',
+                fileName: 'document.html',
+                fileFormat: 'HTML',
+                locale: targetLocale,
+              },
+            ],
+          },
+        ],
+        { sourceLocale }
+      );
+
+      expect(bodyOf(uploadTranslations)).toEqual({
+        data: [
+          expect.objectContaining({
+            source: expect.objectContaining({ locale: 'en-US' }),
+            translations: [expect.objectContaining({ locale: 'es-ES' })],
+          }),
+        ],
+      });
+      expect(response.uploadedFiles.map((file) => file.locale)).toEqual([
+        'source',
+        'target',
+      ]);
+      expect(response.results.map((file) => file.locale)).toEqual([
+        'source',
+        'target',
+      ]);
+    }
+  );
+
+  it('reports partial source upload failures without throwing', async () => {
+    const saved = {
+      branchId: 'branch-id',
+      fileId: 'saved',
+      versionId: 'version-id',
+      fileName: 'saved.json',
+      fileFormat: 'JSON' as const,
+    };
+    const failed = {
+      ...saved,
+      fileId: 'failed',
+      fileName: 'failed.json',
+      status: 'failed' as const,
+      error: 'bad content',
+    };
+    vi.mocked(uploadSourceFiles).mockResolvedValue(
+      result({
+        summary: { total: 2, succeeded: 1, failed: 1 },
+        results: [{ ...saved, status: 'succeeded' as const }, failed],
+      })
+    );
+    const source = (fileName: string) => ({
+      source: {
+        content: '{}',
+        fileName,
+        fileFormat: 'JSON' as const,
+        locale: 'source',
+      },
+    });
+
+    const response = await configuredAdapter().uploadSourceFiles(
+      [source('saved.json'), source('failed.json')],
+      { sourceLocale: 'source' }
+    );
+
+    expect(response.summary).toEqual({ total: 2, succeeded: 1, failed: 1 });
+    expect(response.results[1]).toEqual(failed);
+    expect(response.uploadedFiles).toEqual([{ ...saved, locale: 'source' }]);
+    expect(bodyOf(uploadSourceFiles).sourceLocale).toBe('en-US');
+  });
+
+  it('reports partial translation upload and publish failures without throwing', async () => {
+    const ids = {
+      branchId: 'branch-id',
+      fileId: 'file-id',
+      versionId: 'version-id',
+    };
+    const translation = {
+      ...ids,
+      fileName: 'document.json',
+      fileFormat: 'JSON' as const,
+      locale: 'es-ES',
+    };
+    vi.mocked(uploadTranslations).mockResolvedValue(
+      result({
+        summary: { total: 2, succeeded: 1, failed: 1 },
+        results: [
+          { ...translation, status: 'succeeded' as const },
+          {
+            ...translation,
+            locale: 'fr-FR',
+            status: 'failed' as const,
+            error: 'bad content',
+          },
+        ],
+      })
+    );
+    vi.mocked(publishFiles).mockResolvedValue(
+      result({
+        summary: { total: 2, succeeded: 1, failed: 1 },
+        results: [
+          { ...ids, status: 'succeeded' as const, translations: [] },
+          {
+            ...ids,
+            fileId: 'other-id',
+            status: 'failed' as const,
+            error: 'not found',
+            translations: [],
+          },
+        ],
+      })
+    );
+    const adapter = configuredAdapter();
+    const file = (locale: string) => ({
+      content: '{}',
+      fileName: 'document.json',
+      fileFormat: 'JSON' as const,
+      locale,
+    });
+
+    const uploaded = await adapter.uploadTranslations([
+      { source: file('source'), translations: [file('target'), file('fr')] },
+    ]);
+    const published = await adapter.publishFiles([
+      { ...ids, publish: true },
+      { ...ids, fileId: 'other-id', publish: true },
+    ]);
+
+    expect(uploaded.summary).toEqual({ total: 2, succeeded: 1, failed: 1 });
+    expect(uploaded.results[1]).toEqual({
+      ...translation,
+      locale: 'fr-FR',
+      status: 'failed',
+      error: 'bad content',
+    });
+    expect(uploaded.uploadedFiles).toEqual([
+      { ...translation, locale: 'target' },
+    ]);
+    expect(published.summary).toEqual({ total: 2, succeeded: 1, failed: 1 });
+    expect(published.results.map(({ success }) => success)).toEqual([
+      true,
+      false,
+    ]);
+    expect(published.results[1]).toMatchObject({
+      fileId: 'other-id',
+      status: 'failed',
+      error: 'not found',
+    });
+  });
+
+  it('awaits jobs through queryJobs in the 9.x job shape, with not_found as unknown', async () => {
+    const statuses: Record<string, Record<string, unknown>> = {
+      'failed-job': { status: 'failed', error: null },
+      'missing-job': { status: 'not_found' },
+      'done-job': { status: 'completed' },
+    };
+    const { fetch, requests } = jobsFetch((id) => statuses[id]);
+    const adapter = configuredAdapter(fetch);
+    const jobIds = ['failed-job', 'missing-job', 'done-job'];
+    const legacy = [
+      { jobId: 'failed-job', status: 'failed', error: { message: '' } },
+      { jobId: 'missing-job', status: 'unknown' },
+      { jobId: 'done-job', status: 'completed' },
+    ];
+
+    const onPoll = vi.fn();
+    await expect(adapter.awaitJobs(jobIds, { onPoll })).resolves.toEqual({
+      complete: true,
+      jobs: legacy,
+    });
+    expect(onPoll).toHaveBeenCalledWith(legacy);
+    expect(requests[0]).toEqual({
+      pathname: '/v2/projects/project-id/jobs/query',
+      jobs: jobIds.map((id) => ({ id })),
+    });
+  });
+
+  it('sends only contract fields for publish and overwrite, with superset publish results', async () => {
+    vi.mocked(publishFiles).mockResolvedValue(
+      result(
+        succeeded([
+          {
+            fileId: 'file-id',
+            versionId: 'version-id',
+            branchId: 'branch-id',
+            status: 'succeeded' as const,
+            translations: [{ locale: 'es-ES', status: 'succeeded' as const }],
+          },
+        ])
+      )
+    );
+    vi.mocked(overwriteTranslations).mockResolvedValue(
+      result(
+        succeeded([
+          {
+            fileId: 'file-id',
+            versionId: 'version-id',
+            branchId: 'branch-id',
+            locale: 'es-ES',
+            status: 'succeeded' as const,
+          },
+        ])
+      )
+    );
+    const adapter = configuredAdapter();
+
+    const published = await adapter.publishFiles([
+      {
+        fileId: 'file-id',
+        versionId: 'version-id',
+        branchId: 'branch-id',
+        publish: true,
+        fileName: 'document.json',
+      } as Parameters<typeof adapter.publishFiles>[0][number],
+    ]);
+    await adapter.overwriteTranslations([
+      {
+        fileName: 'document.json',
+        locale: 'target',
+        diff: '@@',
+        branchId: 'branch-id',
+        versionId: 'version-id',
+        fileId: 'file-id',
+        localContent: '{}',
+      } as Parameters<typeof adapter.overwriteTranslations>[0][number],
+    ]);
+
+    expect(bodyOf(publishFiles)).toEqual({
+      files: [
+        {
+          fileId: 'file-id',
+          versionId: 'version-id',
+          branchId: 'branch-id',
+          publish: true,
+        },
+      ],
+    });
+    expect(published.results[0]).toMatchObject({
+      status: 'succeeded',
+      success: true,
+      translations: [{ locale: 'target', status: 'succeeded' }],
+    });
+    expect(published.summary).toEqual({ total: 1, succeeded: 1, failed: 0 });
+    expect(bodyOf(overwriteTranslations)).toEqual({
+      diffs: [
+        {
+          diff: '@@',
+          branchId: 'branch-id',
+          versionId: 'version-id',
+          fileId: 'file-id',
+          localContent: '{}',
+          locale: 'es-ES',
+        },
+      ],
+    });
+  });
+
+  it('keeps exact repeated selectors on the canonical reads for the API to reject', async () => {
+    vi.mocked(queryFiles).mockResolvedValue(result({ results: [] }));
+    vi.mocked(queryFilesContent).mockResolvedValue(result({ results: [] }));
+    const adapter = configuredAdapter();
+    const files = [
+      { fileId: 'file-id', locale: 'target' },
+      { fileId: 'file-id', locale: 'es-es' },
+    ];
+
+    await adapter.queryFiles(files);
+    await adapter.queryFilesContent(files);
+
+    const wire = [
+      { fileId: 'file-id', locale: 'es-ES' },
+      { fileId: 'file-id', locale: 'es-ES' },
+    ];
+    expect(bodyOf(queryFiles)).toEqual({ files: wire });
+    expect(bodyOf(queryFilesContent)).toEqual({ files: wire });
+  });
+
+  it('takes the font organization from config, else from the project once per configuration', async () => {
+    vi.mocked(getProject).mockResolvedValue(result(project));
+    vi.mocked(upsertAssets).mockResolvedValue(result(succeeded([])));
+    const font = { assetType: 'FONT' as const, content: 'x', fileName: 'f' };
+    const adapter = configuredAdapter();
+
+    await adapter.upsertAssets([font]);
+    await adapter.upsertAssets([font]);
+    expect(getProject).toHaveBeenCalledTimes(1);
+
+    adapter.configure({
+      baseUrl: 'https://api.example.com',
+      projectId: 'project-id',
+      orgId: 'configured-org',
+    });
+    await adapter.upsertAssets([font]);
+    expect(getProject).toHaveBeenCalledTimes(1);
+
+    expect(
+      vi.mocked(upsertAssets).mock.calls.map(([options]) => options.path)
+    ).toEqual([
+      { orgId: 'org-id' },
+      { orgId: 'org-id' },
+      { orgId: 'configured-org' },
+    ]);
+  });
+
+  it.each([
+    ['an explicit organization', 'org-B', 0],
+    ['no organization', undefined, 1],
+  ])(
+    'keeps a font upload on its own configuration when reconfigured with %s during the organization lookup',
+    async (_label, orgId, extraLookups) => {
+      let resolveLookup!: (value: unknown) => void;
+      vi.mocked(getProject)
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveLookup = resolve;
+            }) as never
+        )
+        .mockResolvedValue(result({ ...project, orgId: 'org-B' }));
+      vi.mocked(upsertAssets).mockResolvedValue(result(succeeded([])));
+      const font = { assetType: 'FONT' as const, content: 'x', fileName: 'f' };
+      const adapter = configuredAdapter();
+
+      const pendingUpload = adapter.upsertAssets([font]);
+      adapter.configure({
+        baseUrl: 'https://reconfigured.example.com',
+        projectId: 'project-B',
+        orgId,
+      });
+      resolveLookup(result({ ...project, orgId: 'org-A' }));
+      await pendingUpload;
+      await adapter.upsertAssets([font]);
+
+      expect(getProject).toHaveBeenCalledTimes(1 + extraLookups);
+      expect(
+        vi
+          .mocked(upsertAssets)
+          .mock.calls.map(([options]) => [
+            options.client!.getConfig().baseUrl,
+            options.path.orgId,
+          ])
+      ).toEqual([
+        ['https://api.example.com', 'org-A'],
+        ['https://reconfigured.example.com', 'org-B'],
+      ]);
+    }
+  );
+
+  it.each([
+    ['moveFiles', 25],
+    ['upsertAssets', 10],
+  ] as const)(
+    'batches %s at %i items and merges the summaries in request order',
+    async (operation, cap) => {
+      const ids = Array.from({ length: cap + 1 }, (_, i) => `item-${i}`);
+      const items =
+        operation === 'moveFiles'
+          ? ids.map((id) => ({
+              oldFileId: id,
+              newFileId: `${id}-new`,
+              newFileName: `${id}.json`,
+            }))
+          : ids.map((fileName) => ({ fileName }));
+      const echo = (key: string, itemKey: string) =>
+        (async ({
+          body,
+        }: {
+          body: Record<string, Array<Record<string, string>>>;
+        }) =>
+          result(
+            succeeded(
+              body[key].map((item) => ({
+                [itemKey]: item[itemKey],
+                status: 'succeeded',
+              }))
+            )
+          )) as never;
+      vi.mocked(getProject).mockResolvedValue(result(project));
+      vi.mocked(moveFiles).mockImplementation(echo('moves', 'oldFileId'));
+      vi.mocked(upsertAssets).mockImplementation(echo('assets', 'fileName'));
+      const adapter = configuredAdapter();
+
+      const response =
+        operation === 'moveFiles'
+          ? await adapter.moveFiles(items as never)
+          : await adapter.upsertAssets(items as never);
+
+      const mock = operation === 'moveFiles' ? moveFiles : upsertAssets;
+      expect(
+        vi
+          .mocked(mock)
+          .mock.calls.map(
+            ([options]) =>
+              (options.body as Record<string, unknown[]>)[
+                operation === 'moveFiles' ? 'moves' : 'assets'
+              ].length
+          )
+      ).toEqual([cap, 1]);
+      expect(response.summary).toEqual({
+        total: cap + 1,
+        succeeded: cap + 1,
+        failed: 0,
+      });
+      expect(response.results).toHaveLength(cap + 1);
+      expect(
+        response.results.map(
+          (item) => Object.values(item as Record<string, string>)[0]
+        )
+      ).toEqual(ids);
+    }
+  );
+
+  it.each([
+    ['a chain across batches', ['A', 'B'], ['B', 'C']],
+    ['a repeated old file ID', ['A', 'B'], ['A', 'C']],
+    ['a repeated new file ID', ['A', 'B'], ['C', 'B']],
+  ])(
+    'rejects moves with %s before sending any request',
+    async (_label, [firstOld, firstNew], [lastOld, lastNew]) => {
+      const move = (oldFileId: string, newFileId: string) => ({
+        oldFileId,
+        newFileId,
+        newFileName: `${newFileId}.json`,
+      });
+      // 26 moves: the first and last land in different 25-move batches.
+      const moves = [
+        move(firstOld, firstNew),
+        ...Array.from({ length: 24 }, (_, i) => move(`old-${i}`, `new-${i}`)),
+        move(lastOld, lastNew),
+      ];
+
+      await expect(configuredAdapter().moveFiles(moves)).rejects.toThrow(
+        'Each old and each new file ID may appear once in a move list'
+      );
+      expect(moveFiles).not.toHaveBeenCalled();
+    }
+  );
+
+  it('sends no request for an empty font list', async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    const adapter = configuredAdapter(fetchMock);
+
+    await expect(adapter.upsertAssets([])).resolves.toEqual({
+      summary: { total: 0, succeeded: 0, failed: 0 },
+      results: [],
+    });
+    await expect(adapter.uploadFonts([])).resolves.toEqual({
+      assets: [],
+      count: 0,
+    });
+    expect(getProject).not.toHaveBeenCalled();
+    expect(upsertAssets).not.toHaveBeenCalled();
+    expect(legacyUploadAssets).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('renames a branch or makes it the default on the canonical route', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      Response.json({ id: 'branch-id', name: 'main', isDefault: true })
+    );
+
+    await expect(
+      configuredAdapter(fetchMock).updateBranch('branch-id', {
+        name: 'main',
+        isDefault: true,
+      })
+    ).resolves.toEqual({ id: 'branch-id', name: 'main', isDefault: true });
+
+    const request = new Request(...fetchMock.mock.calls[0]);
+    expect(request.method).toBe('PATCH');
+    expect(new URL(request.url).pathname).toBe(
+      '/v2/projects/project-id/branches/branch-id'
+    );
+    expect(request.headers.get('gt-api-version')).toBe(API_VERSION);
+    expect(request.headers.has('gt-project-id')).toBe(false);
+    await expect(request.json()).resolves.toEqual({
+      name: 'main',
+      isDefault: true,
+    });
+  });
+
+  it('sends the deprecated createBranch input to the legacy route and returns its shape', async () => {
+    const legacyBranch = { id: 'branch-id', name: 'main' };
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      Response.json({ branch: legacyBranch })
+    );
+
+    await expect(
+      configuredAdapter(fetchMock).createBranch({
+        branchName: 'main',
+        defaultBranch: true,
+      })
+    ).resolves.toEqual({ branch: legacyBranch });
+
+    expect(createBranch).not.toHaveBeenCalled();
+    const request = new Request(...fetchMock.mock.calls[0]);
+    expect(new URL(request.url).pathname).toBe('/v2/project/branches/create');
+    expect(request.headers.get('gt-api-version')).toBe(LEGACY_API_VERSION);
+    expect(request.headers.get('gt-project-id')).toBe('project-id');
+    await expect(request.json()).resolves.toEqual({
+      branchName: 'main',
+      defaultBranch: true,
+    });
+  });
+
+  // -------- Deprecated methods on the legacy client -------- //
+
+  it('refreshes legacy requests and clears omitted locale mappings on reconfiguration', async () => {
     const fetchMock = vi.fn<typeof fetch>(async () =>
       Response.json({ branchId: 'branch-id' })
     );
@@ -104,80 +810,6 @@ describe.sequential('createGtApiAdapter', () => {
     expect(request.headers.get('gt-project-id')).toBe('new-project');
     expect(adapter.resolveAliasLocale('es-ES')).toBe('es-ES');
   });
-
-  it.each([
-    ['source', 'target'],
-    ['en-us', 'es-es'],
-  ])(
-    'canonicalizes upload locales %s / %s',
-    async (sourceLocale, targetLocale) => {
-      const uploadedFile = {
-        branchId: 'branch-id',
-        fileId: 'file-id',
-        versionId: 'version-id',
-        fileName: 'document.html',
-        fileFormat: 'HTML' as const,
-      };
-      vi.mocked(uploadTranslations).mockResolvedValue(
-        result({
-          uploadedFiles: [
-            { ...uploadedFile, locale: 'en-US' },
-            { ...uploadedFile, locale: 'es-ES' },
-          ],
-          count: 2,
-          message: 'Uploaded files',
-        })
-      );
-      const adapter = createGtApiAdapter();
-      adapter.configure({
-        baseUrl: 'https://api.example.com',
-        customMapping: {
-          source: { code: 'en-US' },
-          target: { code: 'es-ES' },
-        },
-      });
-
-      const response = await adapter.uploadTranslations(
-        [
-          {
-            source: {
-              content: 'source',
-              fileName: 'document.html',
-              fileFormat: 'HTML',
-              locale: sourceLocale,
-            },
-            translations: [
-              {
-                content: 'translation',
-                fileName: 'document.html',
-                fileFormat: 'HTML',
-                locale: targetLocale,
-              },
-            ],
-          },
-        ],
-        { sourceLocale }
-      );
-
-      expect(uploadTranslations).toHaveBeenCalledWith(
-        expect.objectContaining({
-          body: expect.objectContaining({
-            sourceLocale: 'en-US',
-            data: [
-              expect.objectContaining({
-                source: expect.objectContaining({ locale: 'en-US' }),
-                translations: [expect.objectContaining({ locale: 'es-ES' })],
-              }),
-            ],
-          }),
-        })
-      );
-      expect(response.uploadedFiles.map((file) => file.locale)).toEqual([
-        'source',
-        'target',
-      ]);
-    }
-  );
 
   it('maps pending download locales back to configured aliases', async () => {
     const pending = {
@@ -235,6 +867,202 @@ describe.sequential('createGtApiAdapter', () => {
     ]);
   });
 
+  it('exposes raw job statuses alongside the normalized view', async () => {
+    vi.mocked(getTranslationJobInfo).mockResolvedValue(
+      result([{ jobId: 'job-id', status: 'failed', error: { message: null } }])
+    );
+    const adapter = createGtApiAdapter({
+      baseUrl: 'https://api.example.com',
+    });
+    const controller = new AbortController();
+
+    const raw = await adapter.loadJobStatuses(['job-id'], {
+      signal: controller.signal,
+    });
+    const normalized = await adapter.checkJobStatus(['job-id']);
+
+    expect(raw).toEqual([
+      { jobId: 'job-id', status: 'failed', error: { message: null } },
+    ]);
+    expect(normalized).toEqual([
+      { jobId: 'job-id', status: 'failed', error: { message: '' } },
+    ]);
+    expect(getTranslationJobInfo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: { jobIds: ['job-id'] },
+        signal: controller.signal,
+      })
+    );
+  });
+
+  it('maps file-info locales in both directions', async () => {
+    vi.mocked(getFileInfo).mockResolvedValue(
+      result({
+        sourceFiles: [
+          {
+            branchId: 'branch-id',
+            fileId: 'file-id',
+            versionId: 'version-id',
+            fileName: 'document.html',
+            fileFormat: 'HTML',
+            dataFormat: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            publishedAt: null,
+            locales: ['es-ES'],
+            sourceLocale: 'en-US',
+          },
+        ],
+        translatedFiles: [
+          {
+            branchId: 'branch-id',
+            fileId: 'file-id',
+            versionId: 'version-id',
+            fileFormat: 'HTML',
+            dataFormat: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            approvedAt: null,
+            publishedAt: null,
+            completedAt: null,
+            locale: 'es-ES',
+          },
+        ],
+      })
+    );
+    const adapter = createGtApiAdapter();
+    adapter.configure({ baseUrl: 'https://api.example.com', customMapping });
+
+    const response = await adapter.queryFileData({
+      translatedFiles: [
+        {
+          branchId: 'branch-id',
+          fileId: 'file-id',
+          versionId: 'version-id',
+          locale: 'target',
+        },
+      ],
+    });
+
+    expect(getFileInfo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          translatedFiles: [expect.objectContaining({ locale: 'es-ES' })],
+        }),
+      })
+    );
+    expect(response.translatedFiles[0].locale).toBe('target');
+    expect(response.sourceFiles[0]).toMatchObject({
+      sourceLocale: 'source',
+      locales: ['target'],
+    });
+  });
+  it('sends only contract fields for user-edit diffs', async () => {
+    vi.mocked(submitUserEditDiffs).mockResolvedValue(
+      result({ filesProcessed: 1, entriesReceived: 1, message: 'ok' })
+    );
+    const adapter = createGtApiAdapter();
+    adapter.configure({
+      baseUrl: 'https://api.example.com',
+      projectId: 'project-id',
+      customMapping,
+    });
+
+    await adapter.submitUserEditDiffs({
+      projectId: 'project-id',
+      diffs: [
+        {
+          fileName: 'document.json',
+          locale: 'target',
+          diff: '@@',
+          branchId: 'branch-id',
+          versionId: 'version-id',
+          fileId: 'file-id',
+          localContent: '{}',
+        } as SubmitUserEditDiffsData['body']['diffs'][number],
+      ],
+    });
+
+    const diffBody = vi.mocked(submitUserEditDiffs).mock.calls[0][0]!.body;
+    expect(diffBody.diffs[0]).toEqual({
+      diff: '@@',
+      branchId: 'branch-id',
+      versionId: 'version-id',
+      fileId: 'file-id',
+      localContent: '{}',
+      locale: 'es-ES',
+    });
+  });
+
+  it('batches every 100-item operation at the server cap', async () => {
+    const ids = Array.from({ length: 101 }, (_, i) => `id-${i}`);
+    const file = (fileId: string) => ({
+      fileId,
+      versionId: 'v',
+      branchId: 'b',
+    });
+    const upload = (fileId: string) => ({
+      source: {
+        ...file(fileId),
+        content: '{}',
+        fileName: `${fileId}.json`,
+        fileFormat: 'JSON' as const,
+        locale: 'en-US',
+      },
+    });
+    vi.mocked(publishFiles).mockResolvedValue(result(succeeded([])));
+    vi.mocked(queryFiles).mockResolvedValue(result({ results: [] }));
+    vi.mocked(queryFilesContent).mockResolvedValue(result({ results: [] }));
+    vi.mocked(translateFiles).mockResolvedValue(result({ jobs: [] }));
+    vi.mocked(overwriteTranslations).mockResolvedValue(result(succeeded([])));
+    vi.mocked(uploadSourceFiles).mockResolvedValue(result(succeeded([])));
+    vi.mocked(uploadTranslations).mockResolvedValue(result(succeeded([])));
+    const { fetch, requests } = jobsFetch(() => ({ status: 'completed' }));
+    const adapter = configuredAdapter(fetch);
+
+    await adapter.publishFiles(
+      ids.map((id) => ({ ...file(id), publish: true }))
+    );
+    await adapter.queryFiles(ids.map(file));
+    await adapter.queryFilesContent(ids.map(file));
+    await adapter.translateFiles(ids.map(file));
+    await adapter.overwriteTranslations(
+      ids.map((id) => ({
+        ...file(id),
+        locale: 'es',
+        diff: '',
+        localContent: '{}',
+      }))
+    );
+    await adapter.uploadSourceFiles(ids.map(upload), { sourceLocale: 'en-US' });
+    await adapter.uploadTranslations(
+      ids.map((id) => ({ ...upload(id), translations: [] }))
+    );
+    const { results } = await adapter.queryJobs(ids);
+
+    for (const [mock, key] of [
+      [publishFiles, 'files'],
+      [queryFiles, 'files'],
+      [queryFilesContent, 'files'],
+      [translateFiles, 'files'],
+      [overwriteTranslations, 'diffs'],
+      [uploadSourceFiles, 'data'],
+      [uploadTranslations, 'data'],
+    ] as const) {
+      expect(
+        vi
+          .mocked(mock)
+          .mock.calls.map(
+            ([options]) =>
+              (options.body as Record<string, unknown[]>)[key].length
+          ),
+        key
+      ).toEqual([100, 1]);
+    }
+    expect(requests.map(({ jobs }) => jobs.length)).toEqual([100, 1]);
+    expect(results.map(({ id }) => id)).toEqual(ids);
+  });
+
   it('creates a project under the organization with a canonical default locale', async () => {
     vi.mocked(createProject).mockResolvedValue(
       result({
@@ -265,7 +1093,7 @@ describe.sequential('createGtApiAdapter', () => {
   });
 
   it('lists projects across every cursor page', async () => {
-    const project = (id: string) => ({
+    const listed = (id: string) => ({
       id,
       name: id,
       orgId: 'org-id',
@@ -273,13 +1101,13 @@ describe.sequential('createGtApiAdapter', () => {
     });
     vi.mocked(listProjects)
       .mockResolvedValueOnce(
-        result({ items: [project('p1')], nextCursor: 'cursor-1' })
+        result({ items: [listed('p1')], nextCursor: 'cursor-1' })
       )
       .mockResolvedValueOnce(
-        result({ items: [project('p2')], nextCursor: 'cursor-2' })
+        result({ items: [listed('p2')], nextCursor: 'cursor-2' })
       )
       .mockResolvedValueOnce(
-        result({ items: [project('p3')], nextCursor: null })
+        result({ items: [listed('p3')], nextCursor: null })
       );
     const adapter = createGtApiAdapter({
       baseUrl: 'https://api.example.com',
@@ -345,150 +1173,5 @@ describe.sequential('createGtApiAdapter', () => {
         body: { name: 'Dev', permissions: ['project:translations:generate'] },
       })
     );
-  });
-
-  it('exposes raw job statuses alongside the normalized view', async () => {
-    vi.mocked(getTranslationJobInfo).mockResolvedValue(
-      result([{ jobId: 'job-id', status: 'failed', error: { message: null } }])
-    );
-    const adapter = createGtApiAdapter({
-      baseUrl: 'https://api.example.com',
-    });
-    const controller = new AbortController();
-
-    const raw = await adapter.loadJobStatuses(['job-id'], {
-      signal: controller.signal,
-    });
-    const normalized = await adapter.checkJobStatus(['job-id']);
-
-    expect(raw).toEqual([
-      { jobId: 'job-id', status: 'failed', error: { message: null } },
-    ]);
-    expect(normalized).toEqual([
-      { jobId: 'job-id', status: 'failed', error: { message: '' } },
-    ]);
-    expect(getTranslationJobInfo).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: { jobIds: ['job-id'] },
-        signal: controller.signal,
-      })
-    );
-  });
-
-  it('sends only contract fields for publish and user-edit diffs', async () => {
-    vi.mocked(publishFiles).mockResolvedValue(result({ results: [] }));
-    vi.mocked(submitUserEditDiffs).mockResolvedValue(
-      result({ filesProcessed: 1, entriesReceived: 1, message: 'ok' })
-    );
-    const adapter = createGtApiAdapter();
-    adapter.configure({
-      baseUrl: 'https://api.example.com',
-      projectId: 'project-id',
-      customMapping,
-    });
-
-    await adapter.publishFiles([
-      {
-        fileId: 'file-id',
-        versionId: 'version-id',
-        branchId: 'branch-id',
-        publish: true,
-        fileName: 'document.json',
-      } as PublishFilesData['body']['files'][number],
-    ]);
-    await adapter.submitUserEditDiffs({
-      projectId: 'project-id',
-      diffs: [
-        {
-          fileName: 'document.json',
-          locale: 'target',
-          diff: '@@',
-          branchId: 'branch-id',
-          versionId: 'version-id',
-          fileId: 'file-id',
-          localContent: '{}',
-        } as SubmitUserEditDiffsData['body']['diffs'][number],
-      ],
-    });
-
-    const publishBody = vi.mocked(publishFiles).mock.calls[0][0]!.body;
-    expect(publishBody.files[0]).toEqual({
-      fileId: 'file-id',
-      versionId: 'version-id',
-      branchId: 'branch-id',
-      publish: true,
-    });
-    const diffBody = vi.mocked(submitUserEditDiffs).mock.calls[0][0]!.body;
-    expect(diffBody.diffs[0]).toEqual({
-      diff: '@@',
-      branchId: 'branch-id',
-      versionId: 'version-id',
-      fileId: 'file-id',
-      localContent: '{}',
-      locale: 'es-ES',
-    });
-  });
-
-  it('maps file-info locales in both directions', async () => {
-    vi.mocked(getFileInfo).mockResolvedValue(
-      result({
-        sourceFiles: [
-          {
-            branchId: 'branch-id',
-            fileId: 'file-id',
-            versionId: 'version-id',
-            fileName: 'document.html',
-            fileFormat: 'HTML',
-            dataFormat: null,
-            createdAt: '2026-01-01',
-            updatedAt: '2026-01-01',
-            publishedAt: null,
-            locales: ['es-ES'],
-            sourceLocale: 'en-US',
-          },
-        ],
-        translatedFiles: [
-          {
-            branchId: 'branch-id',
-            fileId: 'file-id',
-            versionId: 'version-id',
-            fileFormat: 'HTML',
-            dataFormat: null,
-            createdAt: '2026-01-01',
-            updatedAt: '2026-01-01',
-            approvedAt: null,
-            publishedAt: null,
-            completedAt: null,
-            locale: 'es-ES',
-          },
-        ],
-      })
-    );
-    const adapter = createGtApiAdapter();
-    adapter.configure({ baseUrl: 'https://api.example.com', customMapping });
-
-    const response = await adapter.queryFileData({
-      translatedFiles: [
-        {
-          branchId: 'branch-id',
-          fileId: 'file-id',
-          versionId: 'version-id',
-          locale: 'target',
-        },
-      ],
-    });
-
-    expect(getFileInfo).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: expect.objectContaining({
-          translatedFiles: [expect.objectContaining({ locale: 'es-ES' })],
-        }),
-      })
-    );
-    expect(response.translatedFiles[0].locale).toBe('target');
-    expect(response.sourceFiles[0]).toMatchObject({
-      sourceLocale: 'source',
-      locales: ['target'],
-    });
   });
 });

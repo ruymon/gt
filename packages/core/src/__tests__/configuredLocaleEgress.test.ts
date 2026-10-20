@@ -1,21 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { publishFiles } from '@generaltranslation/api';
 import {
   downloadFiles,
   enqueueFileTranslations,
   generateProjectContext,
   getProjectInfo,
-  publishFiles,
-} from '@generaltranslation/api';
+} from '@generaltranslation/api/legacy';
 import { GTRuntime } from '../runtime';
 import { GT } from '../index';
 
 vi.mock('@generaltranslation/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@generaltranslation/api')>()),
+  publishFiles: vi.fn(),
+}));
+
+vi.mock('@generaltranslation/api/legacy', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@generaltranslation/api/legacy')>()),
   downloadFiles: vi.fn(),
   enqueueFileTranslations: vi.fn(),
   generateProjectContext: vi.fn(),
   getProjectInfo: vi.fn(),
-  publishFiles: vi.fn(),
 }));
 
 function result<T>(data: T) {
@@ -43,7 +47,9 @@ describe.sequential('configured locales at GT service boundaries', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it('preserves configured identity while sending canonical runtime codes', async () => {
-    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      Response.json({ translations: {}, generated: false })
+    );
     vi.stubGlobal('fetch', fetchMock);
     const gt = new GTRuntime(config);
     expect(gt.sourceLocale).toBe('en-us');
@@ -148,27 +154,18 @@ describe.sequential('configured locales at GT service boundaries', () => {
     );
     vi.mocked(publishFiles).mockResolvedValue(
       result({
+        summary: { total: 1, succeeded: 1, failed: 0 },
         results: [
           {
             fileId: 'file-1',
             versionId: 'version-1',
             branchId: 'branch-1',
-            locale: 'en-US',
-            success: true,
-          },
-          {
-            fileId: 'file-2',
-            versionId: 'version-2',
-            branchId: 'branch-2',
-            locale: 'en-GB',
-            success: true,
-          },
-          {
-            fileId: 'file-3',
-            versionId: 'version-3',
-            branchId: 'branch-3',
-            locale: 'fr-FR',
-            success: true,
+            status: 'succeeded' as const,
+            translations: [
+              { locale: 'en-US', status: 'succeeded' as const },
+              { locale: 'en-GB', status: 'succeeded' as const },
+              { locale: 'fr-FR', status: 'succeeded' as const },
+            ],
           },
         ],
       })
@@ -202,11 +199,16 @@ describe.sequential('configured locales at GT service boundaries', () => {
       })
     );
 
-    const published = await gt.publishFiles([]);
-    expect(published.results.map(({ locale }) => locale)).toEqual([
-      'en-us',
-      'british',
-      'fr-FR',
+    const published = await gt.publishFiles([
+      {
+        fileId: 'file-1',
+        versionId: 'version-1',
+        branchId: 'branch-1',
+        publish: true,
+      },
     ]);
+    expect(
+      published.results[0].translations.map(({ locale }) => locale)
+    ).toEqual(['en-us', 'british', 'fr-FR']);
   });
 });

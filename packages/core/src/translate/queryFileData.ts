@@ -1,7 +1,7 @@
 import type {
   GetFileInfoData,
   GetFileInfoResponse,
-} from '@generaltranslation/api';
+} from '@generaltranslation/api/legacy';
 
 export type FileDataQuery = GetFileInfoData['body'];
 

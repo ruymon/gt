@@ -44,7 +44,10 @@ describe.sequential('GT service locale egress', () => {
         'fetch',
         vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
           requests.push((await readRequest(input, init)).body);
-          return jsonResponse({ uploadedFiles: [] });
+          return jsonResponse({
+            summary: { total: 0, succeeded: 0, failed: 0 },
+            results: [],
+          });
         })
       );
 
@@ -82,8 +85,10 @@ describe.sequential('GT service locale egress', () => {
       });
 
       expect(requests).toEqual([
+        expect.not.objectContaining({ sourceLocale: expect.anything() }),
+      ]);
+      expect(requests).toEqual([
         expect.objectContaining({
-          sourceLocale: 'en-US',
           data: [
             expect.objectContaining({
               source: expect.objectContaining({ locale: 'en-US' }),
@@ -118,10 +123,13 @@ describe.sequential('GT service locale egress', () => {
         if (url.pathname.endsWith('/files/download')) {
           return jsonResponse({ files: [] });
         }
-        if (url.pathname.endsWith('/files/upload-files')) {
-          return jsonResponse({ uploadedFiles: [] });
+        if (url.pathname.endsWith('/files/diffs')) {
+          return jsonResponse({ success: true });
         }
-        return jsonResponse({ success: true });
+        return jsonResponse({
+          summary: { total: 0, succeeded: 0, failed: 0 },
+          results: [],
+        });
       })
     );
 
@@ -230,7 +238,7 @@ describe.sequential('GT service locale egress', () => {
           ],
         }),
         expect.objectContaining({
-          pathname: '/v2/project/files/upload-files',
+          pathname: '/v2/projects/test-project/files',
           body: expect.objectContaining({
             sourceLocale: 'en-US',
             data: [

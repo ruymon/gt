@@ -1,4 +1,4 @@
-import type { GetProjectInfoResponse } from '@generaltranslation/api';
+import type { GetProjectInfoResponse } from '@generaltranslation/api/legacy';
 
 // Compatibility response: autoApprove stays optional on the published API.
 export type ProjectInfoResult = Omit<GetProjectInfoResponse, 'autoApprove'> & {

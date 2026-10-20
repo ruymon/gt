@@ -1,4 +1,4 @@
-import type { GenerateProjectContextResponse } from '@generaltranslation/api';
+import type { GenerateProjectContextResponse } from '@generaltranslation/api/legacy';
 import type { FileReference } from '../types-dir/api/file';
 
 // Compatibility input: branchId stays required for published callers while

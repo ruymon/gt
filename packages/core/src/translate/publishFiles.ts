@@ -9,4 +9,11 @@ export type PublishFileEntry = PublishFilesData['body']['files'][number] & {
   fileName?: string;
 };
 
-export type PublishFilesResult = PublishFilesResponse;
+export type PublishFileResult = PublishFilesResponse['results'][number] & {
+  /** @deprecated Use `status === 'succeeded'` instead. */
+  success: boolean;
+};
+
+export type PublishFilesResult = Omit<PublishFilesResponse, 'results'> & {
+  results: PublishFileResult[];
+};

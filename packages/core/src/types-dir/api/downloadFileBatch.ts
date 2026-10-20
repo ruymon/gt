@@ -1,4 +1,4 @@
-import type { DownloadFilesData } from '@generaltranslation/api';
+import type { DownloadFilesData } from '@generaltranslation/api/legacy';
 import { FileFormat } from './file';
 import type { JsonObject } from './json';
 // Types for the downloadFileBatch function

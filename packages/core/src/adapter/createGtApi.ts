@@ -1,49 +1,63 @@
 import {
+  API_VERSION,
+  ApiError,
+  awaitJobs,
   createApiClient,
   createBranch,
   createProject,
   createProjectApiKey,
-  createTag,
   DEFAULT_BATCH_SIZE,
-  downloadFiles,
-  enqueueFileTranslations,
   generateProjectContext,
-  getBranchInfo,
-  getFileInfo,
-  getOrphanedFiles,
-  getProjectInfo,
-  getTranslationJobInfo,
-  getTranslationStatus,
+  getFileContent,
+  getFileStatus,
+  getJob,
+  getProject,
+  listBranchFiles,
+  listBranches,
   listOrgs,
   listProjects,
+  moveFiles,
+  overwriteTranslations,
   paginate,
-  pollJobs,
   processBatches,
-  processFileMoves,
   publishFiles,
-  submitUserEditDiffs,
-  uploadAssets,
+  queryFiles,
+  queryFilesContent,
+  queryJobsInBatches,
+  setTag,
+  translateFiles,
+  updateBranch,
+  updateProject,
   uploadSourceFiles,
   uploadTranslations,
+  upsertAssets,
   type ApiClientConfig,
-  type AwaitJobsOptions,
+  type AwaitJobsOptions as ApiAwaitJobsOptions,
+  type BatchWriteSummary,
   type CreateBranchData,
+  type CreateBranchResponse,
   type CreateProjectApiKeyData,
   type CreateProjectData,
-  type CreateTagData,
-  type DownloadFilesData,
-  type EnqueueFileTranslationsData,
   type GenerateProjectContextData,
-  type GetBranchInfoData,
-  type GetFileInfoData,
-  type GetTranslationJobInfoResponse,
-  type GetTranslationStatusData,
-  type ProcessFileMovesData,
+  type GetFileContentData,
+  type GetFileStatusData,
+  type GetProjectResponse,
+  type JobResult as ApiJobResult,
+  type ListBranchesData,
+  type ListBranchFilesData,
+  type MoveFilesData,
+  type OverwriteTranslationsData,
   type PublishFilesData,
-  type SubmitUserEditDiffsData,
-  type UploadAssetsData,
+  type QueryFilesContentData,
+  type QueryFilesData,
+  type SetTagData,
+  type TranslateFilesData,
+  type UnpolledJobResult,
+  type UpdateBranchData,
+  type UpdateProjectData,
   type UploadSourceFilesData,
   type UploadTranslationsData,
+  type UpsertAssetsData,
 } from '@generaltranslation/api';
 import {
   resolveAliasLocale,
@@ -51,12 +65,17 @@ import {
   standardizeLocale,
 } from '@generaltranslation/format';
 import type { CustomMapping } from '@generaltranslation/format/types';
-import type { DownloadedFile } from '../types-dir/api/downloadFileBatch';
 import type {
   TranslateManyEntry,
   TranslateOptions,
 } from '../types-dir/api/entry';
 import type { TranslateManyResult, TranslationResult } from '../types';
+import type { JobResult } from '../translate/awaitJobs';
+import type {
+  CreateBranchResult,
+  LegacyCreateBranchQuery,
+} from '../translate/createBranch';
+import type { MoveMapping } from '../translate/processFileMoves';
 import { createDiagnosticMessage } from '../logging/diagnostics';
 import {
   translate as translateWithConfig,
@@ -66,6 +85,11 @@ import { decodeFileContent, encodeFileContent } from '../utils/base64';
 import { unwrapApiResult } from '../translate/utils/unwrapApiResult';
 import { validateFileFormatTransforms } from '../translate/utils/validateFileFormatTransform';
 import { isModelProvider, supportedModelProviders } from './modelProvider';
+import { createLegacyGtApiAdapter } from './legacy';
+
+// Server caps per request; DEFAULT_BATCH_SIZE covers the operations capped at 100.
+const MOVE_FILES_BATCH_SIZE = 25;
+const UPSERT_ASSETS_BATCH_SIZE = 10;
 
 async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   const items: T[] = [];
@@ -73,27 +97,101 @@ async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   return items;
 }
 
-function normalizeJobStatus(job: GetTranslationJobInfoResponse[number]): {
-  jobId: string;
-  status: GetTranslationJobInfoResponse[number]['status'];
-  error?: { message: string };
-} {
+type BatchWriteResponse<Result> = {
+  summary: BatchWriteSummary;
+  results: Result[];
+};
+
+/** Sends `items` in batches of at most `batchSize`; summaries add up and results keep request order. */
+async function writeInBatches<Item, Result>(
+  items: readonly Item[],
+  batchSize: number,
+  write: (batch: Item[]) => Promise<BatchWriteResponse<Result>>
+): Promise<BatchWriteResponse<Result>> {
+  const responses = await processBatches(
+    items,
+    async (batch) => [await write(batch)],
+    { batchSize }
+  );
+  const total = (key: keyof BatchWriteSummary) =>
+    responses.reduce((sum, response) => sum + response.summary[key], 0);
   return {
-    jobId: job.jobId,
-    status: job.status,
-    ...(job.status === 'failed'
-      ? { error: { message: job.error.message ?? '' } }
-      : {}),
+    summary: {
+      total: total('total'),
+      succeeded: total('succeeded'),
+      failed: total('failed'),
+    },
+    results: responses.flatMap((response) => response.results),
   };
+}
+
+function toFileSelector({
+  fileId,
+  branchId,
+  versionId,
+  locale,
+}: QueryFilesData['body']['files'][number]) {
+  return { fileId, branchId, versionId, locale };
+}
+
+// 9.x job view: `not_found` (and unpolled jobs) read as `unknown`, and a
+// failed job's error message is a string.
+function toLegacyJob(job: ApiJobResult | UnpolledJobResult): JobResult {
+  if (job.status === 'failed') {
+    return {
+      jobId: job.id,
+      status: 'failed',
+      error: { message: job.error ?? '' },
+    };
+  }
+  return {
+    jobId: job.id,
+    status: job.status === 'not_found' ? 'unknown' : job.status,
+  };
+}
+
+// The server checks this per request; a list split into batches must hold it
+// as a whole, or a later batch could move onto a file an earlier one created.
+function assertDisjointMoves(moves: readonly MoveMapping[]): void {
+  const oldFileIds = new Set(moves.map(({ oldFileId }) => oldFileId));
+  const newFileIds = new Set(moves.map(({ newFileId }) => newFileId));
+  if (
+    oldFileIds.size === moves.length &&
+    newFileIds.size === moves.length &&
+    !Array.from(oldFileIds).some((fileId) => newFileIds.has(fileId))
+  ) {
+    return;
+  }
+  throw new Error(
+    createDiagnosticMessage({
+      source: 'generaltranslation',
+      severity: 'Error',
+      whatHappened:
+        'Each old and each new file ID may appear once in a move list, and no file ID may be both an old and a new file ID',
+      fix: 'Move through an unused file ID in separate `moveFiles()` calls',
+    })
+  );
 }
 
 export type GtApiAdapterConfig = ApiClientConfig & {
   customMapping?: CustomMapping;
+  /** Organization for org-scoped operations (fonts); read from the project when omitted. */
+  orgId?: string;
+};
+
+export type LegacyAwaitJobsOptions = Omit<ApiAwaitJobsOptions, 'onPoll'> & {
+  onPoll?: (statuses: JobResult[]) => void;
 };
 
 export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
   let client: ReturnType<typeof createApiClient> | undefined;
   let config: GtApiAdapterConfig | undefined;
+  let cachedOrgId: string | undefined;
+  const {
+    configure: configureLegacy,
+    createBranch: createLegacyBranch,
+    ...legacy
+  } = createLegacyGtApiAdapter();
 
   // Mapping resolves aliases; standardization also canonicalizes configured
   // spellings such as en-us before they cross the service boundary.
@@ -103,15 +201,15 @@ export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
     );
   }
 
-  // Upload responses echo the canonical locale; callers key lockfile entries
-  // by the configured alias, so map it back before it leaves the adapter.
-  function aliasUploadedFileLocale<T extends { locale?: string }>(file: T): T {
-    return file.locale
+  // Responses echo the canonical locale; callers key lockfile entries by the
+  // configured alias, so map it back before it leaves the adapter.
+  function aliasLocale<T extends { locale?: string }>(item: T): T {
+    return item.locale
       ? {
-          ...file,
-          locale: resolveAliasLocale(file.locale, config?.customMapping),
+          ...item,
+          locale: resolveAliasLocale(item.locale, config?.customMapping),
         }
-      : file;
+      : item;
   }
 
   function getConfig(): GtApiAdapterConfig {
@@ -131,6 +229,37 @@ export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
   function configure(nextConfig: GtApiAdapterConfig): void {
     client = createApiClient(nextConfig);
     config = { ...nextConfig };
+    cachedOrgId = undefined;
+    configureLegacy(nextConfig);
+  }
+
+  function getProjectId(): string {
+    const { projectId } = getConfig();
+    if (!projectId) {
+      throw new Error(
+        createDiagnosticMessage({
+          source: 'generaltranslation',
+          severity: 'Error',
+          whatHappened: 'No project ID is configured for the API client',
+          fix: 'Set `projectId` in the API client configuration',
+        })
+      );
+    }
+    return projectId;
+  }
+
+  // Canonical operations type-require gt-api-version per call, and per-call
+  // headers override the client's, so send the configured version.
+  function apiVersionHeaders() {
+    return { 'gt-api-version': getConfig().apiVersion ?? API_VERSION };
+  }
+
+  function projectRequest(timeoutMs?: number) {
+    return {
+      client: getClient(timeoutMs),
+      headers: apiVersionHeaders(),
+      path: { projectId: getProjectId() },
+    };
   }
 
   async function translate(
@@ -167,31 +296,460 @@ export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
 
   if (defaultConfig) configure(defaultConfig);
 
-  // Raw service responses; the normalized adapter methods build on these and
-  // compatibility facades (CLI) expose them unchanged.
-  async function loadJobStatuses(
-    jobIds: readonly string[],
-    options: { signal?: AbortSignal; timeoutMs?: number } = {}
-  ): Promise<GetTranslationJobInfoResponse> {
-    return unwrapApiResult(
-      await getTranslationJobInfo({
-        body: { jobIds: [...jobIds] },
-        client: getClient(options.timeoutMs),
-        signal: options.signal,
-      })
-    );
-  }
-
-  async function loadProjectInfo(projectId?: string, timeoutMs?: number) {
+  async function loadProject(
+    projectId?: string,
+    timeoutMs?: number
+  ): Promise<GetProjectResponse> {
     const resolvedProjectId = projectId ?? getConfig().projectId;
     if (!resolvedProjectId) {
       throw new Error('Project ID is required to fetch project information');
     }
     return unwrapApiResult(
-      await getProjectInfo({
+      await getProject({
         client: getClient(timeoutMs),
+        headers: apiVersionHeaders(),
         path: { projectId: resolvedProjectId },
       })
+    );
+  }
+
+  function aliasProject<T extends GetProjectResponse>(project: T): T {
+    return {
+      ...project,
+      defaultLocale: resolveAliasLocale(
+        project.defaultLocale,
+        config?.customMapping
+      ),
+      currentLocales: project.currentLocales.map((locale) =>
+        resolveAliasLocale(locale, config?.customMapping)
+      ),
+    };
+  }
+
+  async function listAllBranches(query: ListBranchesData['query']) {
+    return collect(paginate(listBranches, { ...projectRequest(), query }));
+  }
+
+  function createBranchOperation(
+    query: CreateBranchData['body']
+  ): Promise<CreateBranchResponse>;
+  /** @deprecated The `{ branchName, defaultBranch }` input; use `{ name, isDefault }`. */
+  function createBranchOperation(
+    query: LegacyCreateBranchQuery
+  ): Promise<CreateBranchResult>;
+  function createBranchOperation(
+    query: CreateBranchData['body'] | LegacyCreateBranchQuery
+  ): Promise<CreateBranchResponse | CreateBranchResult>;
+  async function createBranchOperation(
+    query: CreateBranchData['body'] | LegacyCreateBranchQuery
+  ): Promise<CreateBranchResponse | CreateBranchResult> {
+    // The legacy route keeps the 9.x rename/upsert/promote semantics.
+    if (!('name' in query)) return createLegacyBranch(query);
+    const body = { name: query.name, isDefault: query.isDefault };
+    try {
+      return unwrapApiResult(await createBranch({ ...projectRequest(), body }));
+    } catch (error) {
+      // 409 also covers a second default branch; only a name match is recoverable.
+      if (!(error instanceof ApiError && error.code === 409)) throw error;
+      // A key without branch read access (403) can't look the branch up.
+      const [branch] = await listAllBranches({ name: [body.name] }).catch(
+        (listError: unknown) => {
+          if (listError instanceof ApiError && listError.code === 403)
+            return [];
+          throw listError;
+        }
+      );
+      if (!branch) throw error;
+      return { branch };
+    }
+  }
+
+  async function moveFilesOperation(
+    moves: MoveFilesData['body']['moves'],
+    options: { branchId?: string; timeout?: number } = {}
+  ) {
+    assertDisjointMoves(moves);
+    return writeInBatches(moves, MOVE_FILES_BATCH_SIZE, async (batch) =>
+      unwrapApiResult(
+        await moveFiles({
+          ...projectRequest(options.timeout),
+          body: { branchId: options.branchId, moves: batch },
+        })
+      )
+    );
+  }
+
+  async function listBranchFilesPage(
+    branchId: string,
+    query: ListBranchFilesData['query'] = {},
+    options: { timeout?: number } = {}
+  ) {
+    const request = projectRequest(options.timeout);
+    return unwrapApiResult(
+      await listBranchFiles({
+        ...request,
+        path: { ...request.path, branchId },
+        query,
+      })
+    );
+  }
+
+  async function generateProjectContextOperation(
+    files: GenerateProjectContextData['body']['files'],
+    options: Omit<GenerateProjectContextData['body'], 'files'> & {
+      timeout?: number;
+    } = {}
+  ) {
+    return unwrapApiResult(
+      await generateProjectContext({
+        ...projectRequest(options.timeout),
+        body: {
+          files: files.map(({ branchId, fileId, versionId }) => ({
+            branchId,
+            fileId,
+            versionId,
+          })),
+          locales: options.locales?.map(resolveServiceLocale),
+          force: options.force,
+        },
+      })
+    );
+  }
+
+  async function translateFilesOperation(
+    files: TranslateFilesData['body']['files'],
+    options: Omit<TranslateFilesData['body'], 'files' | 'modelProvider'> & {
+      modelProvider?: string;
+      timeout?: number;
+    } = {}
+  ) {
+    validateFileFormatTransforms(files);
+    const { modelProvider } = options;
+    if (modelProvider !== undefined && !isModelProvider(modelProvider)) {
+      throw new Error(
+        createDiagnosticMessage({
+          source: 'generaltranslation',
+          severity: 'Error',
+          whatHappened: `Unsupported model provider \`${modelProvider}\``,
+          fix: `Use one of: ${supportedModelProviders.join(', ')}`,
+        })
+      );
+    }
+    const jobs = await processBatches(files, async (batch) => {
+      const response = unwrapApiResult(
+        await translateFiles({
+          ...projectRequest(options.timeout),
+          body: {
+            files: batch.map(
+              ({ branchId, fileId, versionId, fileName, transformFormat }) => ({
+                branchId,
+                fileId,
+                versionId,
+                fileName,
+                transformFormat,
+              })
+            ),
+            targetLocales: options.targetLocales?.map(resolveServiceLocale),
+            sourceLocale: options.sourceLocale
+              ? resolveServiceLocale(options.sourceLocale)
+              : undefined,
+            modelProvider,
+            force: options.force,
+            publish: options.publish,
+          },
+        })
+      );
+      return response.jobs;
+    });
+    return { jobs };
+  }
+
+  async function setTagOperation(tagId: string, body: SetTagData['body']) {
+    const request = projectRequest();
+    return unwrapApiResult(
+      await setTag({ ...request, path: { ...request.path, tagId }, body })
+    );
+  }
+
+  async function overwriteTranslationsOperation(
+    diffs: OverwriteTranslationsData['body']['diffs'],
+    options: { timeout?: number } = {}
+  ) {
+    const response = await writeInBatches(
+      diffs,
+      DEFAULT_BATCH_SIZE,
+      async (batch) =>
+        unwrapApiResult(
+          await overwriteTranslations({
+            ...projectRequest(options.timeout),
+            body: {
+              diffs: batch.map(
+                ({
+                  diff,
+                  branchId,
+                  versionId,
+                  fileId,
+                  localContent,
+                  locale,
+                }) => ({
+                  diff,
+                  branchId,
+                  versionId,
+                  fileId,
+                  localContent,
+                  locale: resolveServiceLocale(locale),
+                })
+              ),
+            },
+          })
+        )
+    );
+    return { ...response, results: response.results.map(aliasLocale) };
+  }
+
+  async function queryFilesOperation(
+    files: QueryFilesData['body']['files'],
+    options: { timeout?: number } = {}
+  ) {
+    const results = await processBatches(files, async (batch) => {
+      const response = unwrapApiResult(
+        await queryFiles({
+          ...projectRequest(options.timeout),
+          body: {
+            files: batch.map((file) =>
+              toFileSelector({
+                ...file,
+                locale: file.locale && resolveServiceLocale(file.locale),
+              })
+            ),
+          },
+        })
+      );
+      return response.results;
+    });
+    return {
+      results: results.map((result) => ({
+        ...aliasLocale(result),
+        ...(result.sourceLocale && {
+          sourceLocale: resolveAliasLocale(
+            result.sourceLocale,
+            config?.customMapping
+          ),
+        }),
+        ...(result.locales && {
+          locales: result.locales.map((locale) =>
+            resolveAliasLocale(locale, config?.customMapping)
+          ),
+        }),
+      })),
+    };
+  }
+
+  async function getFileStatusOperation(
+    fileId: string,
+    query: GetFileStatusData['query'] = {},
+    options: { timeout?: number } = {}
+  ) {
+    const request = projectRequest(options.timeout);
+    const result = unwrapApiResult(
+      await getFileStatus({
+        ...request,
+        path: { ...request.path, fileId },
+        query,
+      })
+    );
+    return {
+      ...result,
+      translations: result.translations.map(aliasLocale),
+      sourceFile: {
+        ...result.sourceFile,
+        sourceLocale: resolveAliasLocale(
+          result.sourceFile.sourceLocale,
+          config?.customMapping
+        ),
+        locales: result.sourceFile.locales.map((locale) =>
+          resolveAliasLocale(locale, config?.customMapping)
+        ),
+      },
+    };
+  }
+
+  // Content reads return decoded file content, as downloads always have.
+  async function queryFilesContentOperation(
+    files: QueryFilesContentData['body']['files'],
+    options: { timeout?: number } = {}
+  ) {
+    const results = await processBatches(files, async (batch) => {
+      const response = unwrapApiResult(
+        await queryFilesContent({
+          ...projectRequest(options.timeout),
+          body: {
+            files: batch.map((file) =>
+              toFileSelector({
+                ...file,
+                locale: file.locale && resolveServiceLocale(file.locale),
+              })
+            ),
+          },
+        })
+      );
+      return response.results;
+    });
+    return {
+      results: results.map((result) => ({
+        ...aliasLocale(result),
+        ...(typeof result.data === 'string' && {
+          data: decodeFileContent(result.data, result.fileFormat),
+        }),
+      })),
+    };
+  }
+
+  async function getFileContentOperation(
+    fileId: string,
+    query: GetFileContentData['query'] = {},
+    options: { timeout?: number } = {}
+  ) {
+    const request = projectRequest(options.timeout);
+    const result = unwrapApiResult(
+      await getFileContent({
+        ...request,
+        path: { ...request.path, fileId },
+        query: {
+          ...query,
+          locale: query.locale && resolveServiceLocale(query.locale),
+        },
+      })
+    );
+    return {
+      ...aliasLocale(result),
+      data:
+        result.data === null
+          ? null
+          : decodeFileContent(result.data, result.fileFormat),
+    };
+  }
+
+  async function uploadSourceFilesOperation(
+    files: Array<{
+      source: UploadSourceFilesData['body']['data'][number]['source'];
+    }>,
+    options: { sourceLocale: string; timeout?: number }
+  ) {
+    const sourceLocale = resolveServiceLocale(options.sourceLocale);
+    const response = await writeInBatches(
+      files,
+      DEFAULT_BATCH_SIZE,
+      async (batch) =>
+        unwrapApiResult(
+          await uploadSourceFiles({
+            ...projectRequest(options.timeout),
+            body: {
+              data: batch.map(({ source }) => ({
+                source: {
+                  ...source,
+                  content: encodeFileContent(source.content, source.fileFormat),
+                  locale: resolveServiceLocale(source.locale),
+                },
+              })),
+              sourceLocale,
+            },
+          })
+        )
+    );
+    return {
+      ...response,
+      // Results carry no locale; take it from the request, as uploads echoed it.
+      uploadedFiles: response.results.flatMap(
+        ({ status, error: _error, ...file }, index) =>
+          status === 'succeeded'
+            ? [
+                aliasLocale({
+                  ...file,
+                  locale: resolveServiceLocale(files[index].source.locale),
+                }),
+              ]
+            : []
+      ),
+    };
+  }
+
+  async function uploadTranslationsOperation(
+    files: UploadTranslationsData['body']['data'],
+    // sourceLocale is accepted from legacy callers; the API no longer takes it.
+    options: { sourceLocale?: string; timeout?: number } = {}
+  ) {
+    validateFileFormatTransforms(files.map(({ source }) => source));
+    const response = await writeInBatches(
+      files,
+      DEFAULT_BATCH_SIZE,
+      async (batch) =>
+        unwrapApiResult(
+          await uploadTranslations({
+            ...projectRequest(options.timeout),
+            body: {
+              data: batch.map(({ source, translations }) => ({
+                source: {
+                  ...source,
+                  content: encodeFileContent(source.content, source.fileFormat),
+                  locale: resolveServiceLocale(source.locale),
+                },
+                translations: translations.map((translation) => ({
+                  ...translation,
+                  locale: resolveServiceLocale(translation.locale),
+                  content: encodeFileContent(
+                    translation.content,
+                    translation.fileFormat
+                  ),
+                })),
+              })),
+            },
+          })
+        )
+    );
+    const results = response.results.map(aliasLocale);
+    return {
+      ...response,
+      results,
+      uploadedFiles: results.flatMap(({ status, error: _error, ...file }) =>
+        status === 'succeeded' ? [file] : []
+      ),
+    };
+  }
+
+  async function upsertAssetsOperation(
+    assets: UpsertAssetsData['body']['assets'],
+    options: { timeout?: number } = {}
+  ) {
+    // No fonts: no request, not even the org lookup.
+    if (assets.length === 0) {
+      return { summary: { total: 0, succeeded: 0, failed: 0 }, results: [] };
+    }
+    // One configuration per call: configure() during the org lookup must not
+    // redirect this upload or let the old org into the new config's cache.
+    const requestConfig = getConfig();
+    const client = getClient(options.timeout);
+    const headers = apiVersionHeaders();
+    const orgId =
+      requestConfig.orgId ??
+      cachedOrgId ??
+      unwrapApiResult(
+        await getProject({
+          client,
+          headers,
+          path: { projectId: getProjectId() },
+        })
+      ).orgId;
+    if (config === requestConfig) cachedOrgId = orgId;
+    return writeInBatches(assets, UPSERT_ASSETS_BATCH_SIZE, async (batch) =>
+      unwrapApiResult(
+        await upsertAssets({
+          client,
+          headers,
+          path: { orgId },
+          body: { assets: batch },
+        })
+      )
     );
   }
 
@@ -210,237 +768,149 @@ export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
     translate,
     translateMany,
 
-    async queryBranchData(body: GetBranchInfoData['body']) {
+    // -------- Canonical operations -------- //
+
+    async getProject(options: { timeout?: number } = {}) {
+      return aliasProject(await loadProject(undefined, options.timeout));
+    },
+
+    async updateProject(
+      body: UpdateProjectData['body'],
+      options: { timeout?: number } = {}
+    ) {
+      const project = unwrapApiResult(
+        await updateProject({
+          ...projectRequest(options.timeout),
+          body: {
+            ...body,
+            defaultLocale:
+              body.defaultLocale && resolveServiceLocale(body.defaultLocale),
+          },
+        })
+      );
+      return aliasProject(project);
+    },
+
+    /** One page of branches. */
+    async listBranches(
+      query: ListBranchesData['query'] = {},
+      options: { timeout?: number } = {}
+    ) {
       return unwrapApiResult(
-        await getBranchInfo({ body, client: getClient() })
+        await listBranches({ ...projectRequest(options.timeout), query })
       );
     },
 
-    async createBranch(body: CreateBranchData['body']) {
-      return unwrapApiResult(await createBranch({ body, client: getClient() }));
-    },
+    /**
+     * `{ name, isDefault }` creates the branch; one that already exists by name
+     * is returned instead of a 409. The deprecated `{ branchName, defaultBranch }`
+     * input calls the legacy route.
+     */
+    createBranch: createBranchOperation,
 
-    async processFileMoves(
-      moves: ProcessFileMovesData['body']['moves'],
-      options: Pick<ProcessFileMovesData['body'], 'branchId'> & {
-        timeout?: number;
-      } = {}
-    ) {
-      const results = await processBatches(moves, async (batch) => {
-        const response = unwrapApiResult(
-          await processFileMoves({
-            body: { branchId: options.branchId, moves: batch },
-            client: getClient(options.timeout),
-          })
-        );
-        return response.results;
-      });
-      const succeeded = results.filter(({ success }) => success).length;
-      return {
-        results,
-        summary: {
-          total: moves.length,
-          succeeded,
-          failed: results.length - succeeded,
-        },
-      };
-    },
-
-    async getOrphanedFiles(
+    /** Renames a branch or makes it the default. Omitted fields stay unchanged. */
+    async updateBranch(
       branchId: string,
-      fileIds: string[],
+      body: UpdateBranchData['body'],
       options: { timeout?: number } = {}
     ) {
-      const request = async (batch: string[]) =>
-        unwrapApiResult(
-          await getOrphanedFiles({
-            body: { branchId, fileIds: batch },
-            client: getClient(options.timeout),
-          })
-        );
-
-      if (fileIds.length === 0) return request([]);
-
-      const results = await processBatches(fileIds, async (batch) => [
-        await request(batch),
-      ]);
-      const orphanedFiles = new Map(
-        results[0].orphanedFiles.map((file) => [file.fileId, file])
-      );
-      for (const result of results.slice(1)) {
-        const batchFileIds = new Set(
-          result.orphanedFiles.map((file) => file.fileId)
-        );
-        for (const fileId of Array.from(orphanedFiles.keys())) {
-          if (!batchFileIds.has(fileId)) orphanedFiles.delete(fileId);
-        }
-      }
-      return { orphanedFiles: Array.from(orphanedFiles.values()) };
-    },
-
-    async setupProject(
-      files: GenerateProjectContextData['body']['files'],
-      options: Omit<GenerateProjectContextData['body'], 'files'> & {
-        timeoutMs?: number;
-      } = {}
-    ) {
+      const request = projectRequest(options.timeout);
       return unwrapApiResult(
-        await generateProjectContext({
-          body: {
-            files: files.map(({ branchId, fileId, versionId }) => ({
-              branchId,
-              fileId,
-              versionId,
-            })),
-            locales: options.locales?.map((locale) =>
-              resolveServiceLocale(locale)
-            ),
-            force: options.force,
-          },
-          client: getClient(options.timeoutMs),
+        await updateBranch({
+          ...request,
+          path: { ...request.path, branchId },
+          body,
         })
       );
     },
 
-    loadJobStatuses,
+    /** Rejects a move list whose file IDs overlap before sending any request. */
+    moveFiles: moveFilesOperation,
+    /** One page of the branch's files. */
+    listBranchFiles: listBranchFilesPage,
+    generateProjectContext: generateProjectContextOperation,
 
-    async checkJobStatus(jobIds: string[], timeoutMs?: number) {
-      const statuses = await loadJobStatuses(jobIds, { timeoutMs });
-      return statuses.map(normalizeJobStatus);
-    },
-
-    async awaitJobs(jobIds: readonly string[], options?: AwaitJobsOptions) {
-      const result = await pollJobs(
-        jobIds,
-        (pendingJobIds, signal) => loadJobStatuses(pendingJobIds, { signal }),
-        options
-      );
-      return {
-        ...result,
-        jobs: result.jobs.map(normalizeJobStatus),
-      };
-    },
-
-    async enqueueFiles(
-      files: EnqueueFileTranslationsData['body']['files'],
-      options: {
-        sourceLocale?: string;
-        targetLocales: string[];
-        modelProvider?: string;
-        force?: boolean;
-        timeout?: number;
-      }
+    async queryJobs(
+      jobIds: readonly string[],
+      options: { signal?: AbortSignal; timeout?: number } = {}
     ) {
-      validateFileFormatTransforms(files);
-      const modelProvider = options.modelProvider;
-      if (modelProvider !== undefined && !isModelProvider(modelProvider)) {
-        throw new Error(
-          createDiagnosticMessage({
-            source: 'generaltranslation',
-            severity: 'Error',
-            whatHappened: `Unsupported model provider \`${modelProvider}\``,
-            fix: `Use one of: ${supportedModelProviders.join(', ')}`,
-          })
-        );
-      }
-      const targetLocales = options.targetLocales.map((locale) =>
-        resolveServiceLocale(locale)
-      );
-      const result = await processBatches(files, async (batch) => {
-        const response = unwrapApiResult(
-          await enqueueFileTranslations({
-            body: {
-              files: batch.map(
-                ({
-                  branchId,
-                  fileId,
-                  versionId,
-                  fileName,
-                  transformFormat,
-                }) => ({
-                  branchId,
-                  fileId,
-                  versionId,
-                  fileName,
-                  transformFormat,
-                })
-              ),
-              targetLocales,
-              sourceLocale: options.sourceLocale
-                ? resolveServiceLocale(options.sourceLocale)
-                : undefined,
-              modelProvider,
-              force: options.force,
-            },
-            client: getClient(options.timeout),
-          })
-        );
-        const jobData =
-          'jobData' in response ? response.jobData : response.data;
-        return Object.entries(jobData);
-      });
-
       return {
-        jobData: Object.fromEntries(result),
-        locales: targetLocales,
-        message: `Successfully enqueued ${result.length} file translation jobs in ${Math.ceil(files.length / DEFAULT_BATCH_SIZE)} batch(es)`,
-      };
-    },
-
-    async createTag(body: CreateTagData['body']) {
-      return unwrapApiResult(await createTag({ body, client: getClient() }));
-    },
-
-    async publishFiles(files: PublishFilesData['body']['files']) {
-      // Compatibility callers pass entries carrying fileName; map only the
-      // contract fields so nothing outside the generated body reaches the wire.
-      return unwrapApiResult(
-        await publishFiles({
-          body: {
-            files: files.map(({ fileId, versionId, branchId, publish }) => ({
-              fileId,
-              versionId,
-              branchId,
-              publish,
-            })),
-          },
-          client: getClient(),
-        })
-      );
-    },
-
-    async submitUserEditDiffs(
-      body: SubmitUserEditDiffsData['body'],
-      options: { timeout?: number } = {}
-    ) {
-      return processBatches(body.diffs, async (diffs) => [
-        unwrapApiResult(
-          await submitUserEditDiffs({
-            body: {
-              projectId: body.projectId,
-              diffs: diffs.map(
-                ({
-                  diff,
-                  branchId,
-                  versionId,
-                  fileId,
-                  localContent,
-                  locale,
-                }) => ({
-                  diff,
-                  branchId,
-                  versionId,
-                  fileId,
-                  localContent,
-                  locale: resolveServiceLocale(locale),
-                })
-              ),
-            },
-            client: getClient(options.timeout),
-          })
+        results: await queryJobsInBatches(
+          getClient(options.timeout),
+          getProjectId(),
+          jobIds,
+          options.signal
         ),
-      ]);
+      };
     },
+
+    /** Polls on queryJobs; jobs keep the 9.x `{ jobId, status }` shape. */
+    async awaitJobs(
+      jobIds: readonly string[],
+      options: LegacyAwaitJobsOptions = {}
+    ) {
+      const { onPoll } = options;
+      const result = await awaitJobs(getClient(), getProjectId(), jobIds, {
+        ...options,
+        onPoll: onPoll && ((statuses) => onPoll(statuses.map(toLegacyJob))),
+      });
+      return { ...result, jobs: result.jobs.map(toLegacyJob) };
+    },
+
+    async getJob(jobId: string, options: { timeout?: number } = {}) {
+      const request = projectRequest(options.timeout);
+      return unwrapApiResult(
+        await getJob({ ...request, path: { ...request.path, jobId } })
+      );
+    },
+
+    translateFiles: translateFilesOperation,
+    setTag: setTagOperation,
+
+    /** Batched at the server cap; never throws on per-item failures. */
+    async publishFiles(files: PublishFilesData['body']['files']) {
+      const response = await writeInBatches(
+        files,
+        DEFAULT_BATCH_SIZE,
+        async (batch) =>
+          unwrapApiResult(
+            await publishFiles({
+              ...projectRequest(),
+              // Compatibility callers pass entries carrying fileName; map only
+              // the contract fields so nothing else reaches the wire.
+              body: {
+                files: batch.map(
+                  ({ fileId, versionId, branchId, publish }) => ({
+                    fileId,
+                    versionId,
+                    branchId,
+                    publish,
+                  })
+                ),
+              },
+            })
+          )
+      );
+      return {
+        ...response,
+        results: response.results.map((result) => ({
+          ...result,
+          translations: result.translations.map(aliasLocale),
+          success: result.status === 'succeeded',
+        })),
+      };
+    },
+
+    overwriteTranslations: overwriteTranslationsOperation,
+    queryFiles: queryFilesOperation,
+    getFileStatus: getFileStatusOperation,
+    getFileContent: getFileContentOperation,
+    queryFilesContent: queryFilesContentOperation,
+    /** Never throws on per-item failures; `uploadedFiles` lists only saved files. */
+    uploadSourceFiles: uploadSourceFilesOperation,
+    /** Never throws on per-item failures; `uploadedFiles` lists only saved files. */
+    uploadTranslations: uploadTranslationsOperation,
+    upsertAssets: upsertAssetsOperation,
 
     async createProject(
       orgId: CreateProjectData['path']['orgId'],
@@ -481,210 +951,9 @@ export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
       );
     },
 
-    loadProjectInfo,
+    // -------- Deprecated: 9.x methods on the 2026-03-06.v1 legacy routes -------- //
 
-    async getProjectInfo(projectId?: string, timeoutMs?: number) {
-      const result = await loadProjectInfo(projectId, timeoutMs);
-      return {
-        ...result,
-        defaultLocale: resolveAliasLocale(
-          result.defaultLocale,
-          config?.customMapping
-        ),
-        currentLocales: result.currentLocales.map((locale) =>
-          resolveAliasLocale(locale, config?.customMapping)
-        ),
-      };
-    },
-
-    async queryFileData(body: GetFileInfoData['body'], timeoutMs?: number) {
-      const result = unwrapApiResult(
-        await getFileInfo({
-          body: {
-            ...body,
-            translatedFiles: body.translatedFiles?.map((file) => ({
-              ...file,
-              locale: resolveServiceLocale(file.locale),
-            })),
-          },
-          client: getClient(timeoutMs),
-        })
-      );
-      return {
-        ...result,
-        translatedFiles: result.translatedFiles.map((file) => ({
-          ...file,
-          locale: resolveAliasLocale(file.locale, config?.customMapping),
-        })),
-        sourceFiles: result.sourceFiles.map((file) => ({
-          ...file,
-          sourceLocale: resolveAliasLocale(
-            file.sourceLocale,
-            config?.customMapping
-          ),
-          locales: file.locales.map((locale) =>
-            resolveAliasLocale(locale, config?.customMapping)
-          ),
-        })),
-      };
-    },
-
-    async querySourceFile(
-      path: GetTranslationStatusData['path'],
-      query: GetTranslationStatusData['query'] = {},
-      timeoutMs?: number
-    ) {
-      const result = unwrapApiResult(
-        await getTranslationStatus({
-          path,
-          query,
-          client: getClient(timeoutMs),
-        })
-      );
-      return {
-        ...result,
-        translations: result.translations.map((translation) => ({
-          ...translation,
-          locale: resolveAliasLocale(translation.locale, config?.customMapping),
-        })),
-        sourceFile: {
-          ...result.sourceFile,
-          sourceLocale: resolveAliasLocale(
-            result.sourceFile.sourceLocale,
-            config?.customMapping
-          ),
-          locales: result.sourceFile.locales.map((locale) =>
-            resolveAliasLocale(locale, config?.customMapping)
-          ),
-        },
-      };
-    },
-
-    async downloadFileBatch(
-      files: DownloadFilesData['body'],
-      options: { timeout?: number } = {}
-    ) {
-      const request = async (batch: DownloadFilesData['body']) =>
-        unwrapApiResult(
-          await downloadFiles({
-            body: batch.map((file) => ({
-              ...file,
-              locale: file.locale
-                ? resolveServiceLocale(file.locale)
-                : undefined,
-            })),
-            client: getClient(options.timeout),
-          })
-        );
-      const responses = await processBatches(files, async (batch) => [
-        await request(batch),
-      ]);
-      return {
-        files: responses.flatMap((response) =>
-          response.files.map(
-            (file): DownloadedFile => ({
-              ...file,
-              ...(file.locale && {
-                locale: resolveAliasLocale(file.locale, config?.customMapping),
-              }),
-              data: decodeFileContent(file.data, file.fileFormat),
-              metadata: file.metadata,
-            })
-          )
-        ),
-        count: responses.reduce((count, response) => count + response.count, 0),
-        pending: responses.flatMap((response) =>
-          (response.pending ?? []).map((file) => ({
-            ...file,
-            locale: resolveAliasLocale(file.locale, config?.customMapping),
-          }))
-        ),
-      };
-    },
-
-    async uploadSourceFiles(
-      files: Array<{
-        source: UploadSourceFilesData['body']['data'][number]['source'];
-      }>,
-      options: { sourceLocale: string; timeout?: number }
-    ) {
-      const sourceLocale = resolveServiceLocale(options.sourceLocale);
-      const result = await processBatches(files, async (batch) => {
-        const response = unwrapApiResult(
-          await uploadSourceFiles({
-            body: {
-              data: batch.map(({ source }) => ({
-                source: {
-                  ...source,
-                  content: encodeFileContent(source.content, source.fileFormat),
-                  locale: resolveServiceLocale(source.locale),
-                },
-              })),
-              sourceLocale,
-            },
-            client: getClient(options.timeout),
-          })
-        );
-        return response.uploadedFiles.map(aliasUploadedFileLocale);
-      });
-
-      return { uploadedFiles: result };
-    },
-
-    async uploadFonts(
-      fonts: UploadAssetsData['body']['assets'],
-      options: { timeout?: number } = {}
-    ) {
-      const assets = await processBatches(
-        fonts,
-        async (batch) => {
-          const result = unwrapApiResult(
-            await uploadAssets({
-              body: { assets: batch },
-              client: getClient(options.timeout),
-            })
-          );
-          return result.assets;
-        },
-        { batchSize: 50 }
-      );
-      return { assets, count: assets.length };
-    },
-
-    async uploadTranslations(
-      files: UploadTranslationsData['body']['data'],
-      options: { sourceLocale: string; timeout?: number }
-    ) {
-      validateFileFormatTransforms(files.map(({ source }) => source));
-      const result = await processBatches(files, async (batch) => {
-        const response = unwrapApiResult(
-          await uploadTranslations({
-            body: {
-              data: batch.map(({ source, translations }) => ({
-                source: {
-                  ...source,
-                  content: encodeFileContent(source.content, source.fileFormat),
-                  locale: resolveServiceLocale(source.locale),
-                },
-                translations: translations.map((translation) => ({
-                  ...translation,
-                  locale: resolveServiceLocale(translation.locale),
-                  content: encodeFileContent(
-                    translation.content,
-                    translation.fileFormat
-                  ),
-                })),
-              })),
-              sourceLocale: resolveServiceLocale(options.sourceLocale),
-            },
-            client: getClient(options.timeout),
-          })
-        );
-        return response.uploadedFiles.map(aliasUploadedFileLocale);
-      });
-
-      return { uploadedFiles: result };
-    },
+    ...legacy,
   };
 }
 

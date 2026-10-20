@@ -33,6 +33,11 @@ const translatedFile = {
   locale: 'es-ES',
 };
 
+const emptyBatch = {
+  summary: { total: 0, succeeded: 0, failed: 0 },
+  results: [],
+};
+
 describe('Sanity API adapter', () => {
   const fetchMock = vi.fn<typeof fetch>();
 
@@ -40,6 +45,7 @@ describe('Sanity API adapter', () => {
     vi.resetAllMocks();
     configureApiClient({
       baseUrl: 'https://api.example.com',
+      projectId: 'project-id',
       fetch: fetchMock,
       customMapping: {
         source: { code: 'en-US' },
@@ -91,14 +97,10 @@ describe('Sanity API adapter', () => {
             translations: Array<{ locale: string }>;
           }>;
         };
-        expect(body.sourceLocale).toBe('en-US');
+        expect(body.sourceLocale).toBeUndefined();
         expect(body.data[0].source.locale).toBe('en-US');
         expect(body.data[0].translations[0].locale).toBe('es-ES');
-        return Response.json({
-          uploadedFiles: [],
-          count: 0,
-          message: 'Uploaded files',
-        });
+        return Response.json(emptyBatch);
       });
 
       await api.uploadTranslations(
@@ -134,11 +136,7 @@ describe('Sanity API adapter', () => {
         sourceLocale: 'en-US',
         data: [{ source: { locale: 'en-US' } }],
       });
-      return Response.json({
-        uploadedFiles: [],
-        count: 0,
-        message: 'Uploaded files',
-      });
+      return Response.json(emptyBatch);
     });
     const files = [
       {
@@ -242,7 +240,9 @@ describe('Sanity API adapter', () => {
     });
     fetchMock.mockImplementation(async (request) => {
       const parsed = new Request(request);
-      expect(new URL(parsed.url).pathname).toBe('/v2/translate');
+      expect(new URL(parsed.url).pathname).toBe(
+        '/v2/projects/project-id/translate'
+      );
       const body = JSON.parse(await parsed.text()) as {
         requests: Record<string, unknown>;
         sourceLocale: string;
@@ -252,8 +252,8 @@ describe('Sanity API adapter', () => {
         sourceLocale: 'en-US',
         targetLocale: 'es-ES',
       });
-      return Response.json(
-        Object.fromEntries(
+      return Response.json({
+        translations: Object.fromEntries(
           Object.keys(body.requests).map((hash) => [
             hash,
             {
@@ -263,8 +263,9 @@ describe('Sanity API adapter', () => {
               dataFormat: 'STRING',
             },
           ])
-        )
-      );
+        ),
+        generated: true,
+      });
     });
 
     await expect(

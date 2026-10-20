@@ -1,3 +1,7 @@
+import type {
+  UploadSourceFilesResponse,
+  UploadTranslationsResponse,
+} from '@generaltranslation/api';
 import type { DataFormat } from '@generaltranslation/format/types';
 import { FileFormat, FileReference, type FormatMetadata } from './file';
 
@@ -44,11 +48,20 @@ export type UploadFilesOptions = {
   timeout?: number;
 };
 
-export type UploadFilesResponse = {
+type LegacyUploadFilesFields = {
+  /** @deprecated Use the `succeeded` items of `results` instead. */
   uploadedFiles: FileReference[];
+  /** @deprecated Use `summary.succeeded` instead. */
   count: number;
+  /** @deprecated Use `summary` instead. */
   message: string;
 };
+
+export type UploadFilesResponse = LegacyUploadFilesFields &
+  UploadSourceFilesResponse;
+
+export type UploadTranslationsResult = LegacyUploadFilesFields &
+  UploadTranslationsResponse;
 
 export type RequiredUploadFilesOptions = UploadFilesOptions &
   Required<Pick<UploadFilesOptions, 'sourceLocale'>>;

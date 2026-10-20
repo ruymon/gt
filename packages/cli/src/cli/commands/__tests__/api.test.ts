@@ -42,7 +42,7 @@ describe('gt api', () => {
       expect(new URL(request.url).pathname).toBe('/v2/example');
       expect(request.method).toBe('POST');
       expect(request.headers.get('authorization')).toBe('Bearer api-key');
-      expect(request.headers.get('gt-project-id')).toBe('project-id');
+      expect(request.headers.get('gt-project-id')).toBeNull();
       expect(request.headers.get('x-test')).toBe('value, second');
       expect(request.headers.get('content-type')).toBe('application/json');
       expect(await request.text()).toBe(requestBody);
@@ -118,7 +118,7 @@ describe('gt api', () => {
     );
     const fetchMock = vi.fn<typeof fetch>(async (request) => {
       expect(request.url).toBe('https://api.example/v2/example');
-      expect(request.headers.get('gt-project-id')).toBe('config-project');
+      expect(request.headers.get('gt-project-id')).toBeNull();
       return new Response('{}');
     });
 
@@ -263,13 +263,13 @@ describe('gt api', () => {
     );
 
     expect(outputText(stdout).split('\n')).toContain(
-      'POST\t/v2/project/files/info\tgetFileInfo\tGet file metadata'
+      'POST\t/v2/projects/{projectId}/files/query\tqueryFiles\tGet file metadata'
     );
   });
 
   it.each([
-    ['a concrete path', '/v2/project/info/abc?x=1'],
-    ['an operation ID', 'getProjectInfo'],
+    ['a concrete path', '/v2/projects/abc?x=1'],
+    ['an operation ID', 'getProject'],
   ])(
     'prints one operation with references resolved for %s',
     async (_, endpoint) => {
@@ -283,7 +283,7 @@ describe('gt api', () => {
 
       const output = outputText(stdout);
       expect(Object.keys(JSON.parse(output).paths)).toEqual([
-        '/v2/project/info/{projectId}',
+        '/v2/projects/{projectId}',
       ]);
       expect(output).not.toContain('#/components/schemas/ApiVersion');
     }
@@ -300,7 +300,7 @@ describe('gt api', () => {
       return JSON.parse(outputText(stdout));
     };
 
-    const translate = await lookup('translate');
+    const translate = await lookup('translateContent');
     expect(JSON.stringify(translate.paths)).toContain(
       '#/components/schemas/JsonValue'
     );

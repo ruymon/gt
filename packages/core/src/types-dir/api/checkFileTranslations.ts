@@ -1,4 +1,4 @@
-import type { GetTranslationStatusResponse } from '@generaltranslation/api';
+import type { GetTranslationStatusResponse } from '@generaltranslation/api/legacy';
 
 export type CheckFileTranslationsOptions = {
   timeout?: number;

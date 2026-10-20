@@ -1,10 +1,16 @@
-import type { CreateBranchResponse } from '@generaltranslation/api';
+import type { CreateBranchData } from '@generaltranslation/api';
+import type { CreateBranchResponse } from '@generaltranslation/api/legacy';
 
-// Compatibility input: defaultBranch remains required on the published method,
-// while the generated request makes it optional.
-export type CreateBranchQuery = {
+export type LegacyCreateBranchQuery = {
+  /** @deprecated Use `name` instead. */
   branchName: string;
-  defaultBranch: boolean;
+  /** @deprecated Use `isDefault` instead. */
+  defaultBranch?: boolean;
 };
 
+export type CreateBranchQuery =
+  | CreateBranchData['body']
+  | LegacyCreateBranchQuery;
+
+/** The result for the deprecated `{ branchName }` input; `{ name }` returns `CreateBranchResponse`. */
 export type CreateBranchResult = CreateBranchResponse;
