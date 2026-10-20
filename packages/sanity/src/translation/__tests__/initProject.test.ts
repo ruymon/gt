@@ -5,7 +5,7 @@ import { initProject } from '../initProject';
 
 vi.mock('../../adapter/core', () => ({
   api: {
-    setupProject: vi.fn(),
+    generateProjectContext: vi.fn(),
     awaitJobs: vi.fn(),
   },
   overrideConfig: vi.fn(),
@@ -14,15 +14,35 @@ vi.mock('../../adapter/core', () => ({
   },
 }));
 
+const uploadedFile = {
+  branchId: 'branch-id',
+  fileId: 'file-id',
+  versionId: 'version-id',
+  fileName: 'sanity/file-id',
+  fileFormat: 'HTML',
+  status: 'succeeded',
+} as const;
+
 const uploadResult = {
-  uploadedFiles: [
+  summary: { total: 2, succeeded: 1, failed: 1 },
+  results: [
+    uploadedFile,
     {
-      branchId: 'branch-id',
-      fileId: 'file-id',
-      versionId: 'version-id',
+      ...uploadedFile,
+      fileId: 'failed-file-id',
+      status: 'failed',
+      error: 'not saved',
     },
   ],
 } as Parameters<typeof initProject>[0];
+
+const setupJob = {
+  id: 'setup-job',
+  status: 'queued',
+  subject: { type: 'project_context', projectId: 'project-id' },
+} as unknown as NonNullable<
+  Awaited<ReturnType<typeof api.generateProjectContext>>['job']
+>;
 
 const secrets: Secrets = {
   organization: 'organization-id',
@@ -34,10 +54,7 @@ const consoleLog = vi.fn();
 async function runWithAwaitResult(
   awaitResult: Awaited<ReturnType<typeof api.awaitJobs>>
 ) {
-  vi.mocked(api.setupProject).mockResolvedValue({
-    status: 'queued',
-    setupJobId: 'setup-job',
-  });
+  vi.mocked(api.generateProjectContext).mockResolvedValue({ job: setupJob });
   vi.mocked(api.awaitJobs).mockResolvedValue(awaitResult);
 
   return initProject(uploadResult, { timeout: 30 }, secrets);
@@ -66,6 +83,26 @@ describe('initProject', () => {
       pollingIntervalSeconds: 2,
       timeoutSeconds: 30,
     });
+  });
+
+  it('generates context for uploaded files only', async () => {
+    await runWithAwaitResult({
+      complete: true,
+      jobs: [{ jobId: 'setup-job', status: 'completed' }],
+    });
+
+    expect(api.generateProjectContext).toHaveBeenCalledWith([uploadedFile], {
+      locales: ['es'],
+    });
+  });
+
+  it('does not poll when the project context is already current', async () => {
+    vi.mocked(api.generateProjectContext).mockResolvedValue({ job: null });
+
+    await expect(initProject(uploadResult, {}, secrets)).resolves.toBe(true);
+
+    expect(api.awaitJobs).not.toHaveBeenCalled();
+    expect(consoleLog).not.toHaveBeenCalled();
   });
 
   it('reports failed setup jobs', async () => {

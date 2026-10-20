@@ -29,6 +29,11 @@ import { logger } from '../console/logger.js';
 import { recordWarning } from '../state/translateWarnings.js';
 import { getRelative } from '../fs/findFilepath.js';
 
+export type UserEditDiffResults = {
+  saved: SubmitUserEditDiff[];
+  failed: SubmitUserEditDiff[];
+};
+
 type LatestDownloadedVersion = {
   versionId: string;
   entry: DownloadedTranslation;
@@ -65,12 +70,13 @@ const findLatestDownloadedVersion = (
  * edit to one locale is submitted under that locale alone.
  *
  * Must run before enqueueing new translations so rules are available to the generator.
+ * Returns the edits the API saved and the ones it failed to save; each failure is logged.
  */
 export async function collectAndSendUserEditDiffs(
   files: FileReference[],
   settings: Settings
-): Promise<boolean> {
-  if (!settings.files) return false;
+): Promise<UserEditDiffResults> {
+  if (!settings.files) return { saved: [], failed: [] };
 
   const { resolvedPaths, placeholderPaths, transformPaths, transformFormats } =
     settings.files;
@@ -159,32 +165,35 @@ export async function collectAndSendUserEditDiffs(
       branchId: c.branchId,
     }));
 
-    // Single batched check to obtain translation IDs
-    const checkResponse = await api.queryFileData({
-      translatedFiles: fileQueryData,
-    });
-    const translatedFiles =
-      checkResponse.translatedFiles?.filter((t) => t.completedAt) ?? [];
+    // Single batched check for completed translations; results follow the
+    // selector order
+    const { results: fileResults } = await api.queryFiles(fileQueryData);
+    const translatedFiles = fileQueryData.filter(
+      (_, index) =>
+        fileResults[index]?.status === 'found' &&
+        !!fileResults[index].completedAt
+    );
 
     // The server's copy of each candidate, keyed like the candidates
     type ServerPayload = { data: string; fileFormat: FileFormat };
     const serverPayloadByKey = new Map<string, ServerPayload>();
     try {
-      const resp = await api.downloadFileBatch(
-        translatedFiles.map((file) => ({
-          branchId: file.branchId,
-          fileId: file.fileId,
-          locale: file.locale,
-          versionId: file.versionId,
-        }))
-      );
-      for (const f of resp?.files || []) {
-        if (!f.locale) continue;
+      const { results: contentResults } =
+        await api.queryFilesContent(translatedFiles);
+      contentResults.forEach((result, index) => {
+        if (
+          result.status !== 'ready' ||
+          typeof result.data !== 'string' ||
+          !result.fileFormat
+        ) {
+          return;
+        }
+        const f = translatedFiles[index];
         serverPayloadByKey.set(
           `${f.branchId}:${f.fileId}:${f.versionId}:${f.locale}`,
-          { data: f.data, fileFormat: f.fileFormat }
+          { data: result.data, fileFormat: result.fileFormat }
         );
-      }
+      });
     } catch {
       // Ignore chunk failures; proceed with what we have
     }
@@ -306,6 +315,16 @@ export async function collectAndSendUserEditDiffs(
             }
           }
 
+          // The API rejects empty content, so an emptied file cannot be saved
+          if (localContent.length === 0) {
+            const relativePath = getRelative(c.outputPath);
+            const reason =
+              'Edited file is empty, so its changes cannot be submitted';
+            logger.warn(`Skipping local edits to ${relativePath}: ${reason}`);
+            recordWarning('skipped_file', relativePath, reason);
+            continue;
+          }
+
           collectedDiffs.push({
             fileName: c.fileName,
             locale: c.locale,
@@ -322,9 +341,22 @@ export async function collectAndSendUserEditDiffs(
     }
   }
 
-  if (collectedDiffs.length > 0) {
-    await api.submitUserEditDiffs({ diffs: collectedDiffs });
-  }
+  const saveResults: UserEditDiffResults = { saved: [], failed: [] };
+  if (collectedDiffs.length === 0) return saveResults;
 
-  return collectedDiffs.length > 0;
+  // Results follow request order; a failed edit is reported and skipped.
+  const { results } = await api.overwriteTranslations(collectedDiffs);
+  results.forEach((result, index) => {
+    const edit = collectedDiffs[index];
+    if (result.status !== 'failed') {
+      saveResults.saved.push(edit);
+      return;
+    }
+    const reason = `Locale ${edit.locale}: ${result.error ?? 'Unknown error'}`;
+    logger.warn(`Failed to save local edits to ${edit.fileName}: ${reason}`);
+    recordWarning('failed_edit_save', edit.fileName, reason);
+    saveResults.failed.push(edit);
+  });
+
+  return saveResults;
 }

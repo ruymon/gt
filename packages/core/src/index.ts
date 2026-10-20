@@ -231,23 +231,6 @@ export class GT extends GTRuntime {
     };
   }
 
-  // Results follow selector order, so each translation gets back the exact
-  // locale identity it was requested with.
-  private async _queryFilesContent(
-    files: QueryFilesContentData['body']['files'],
-    options: DownloadFileBatchOptions
-  ): Promise<QueryFilesContentResponse> {
-    const { results } = await this._getApiAdapter().queryFilesContent(
-      files,
-      options
-    );
-    return {
-      results: results.map((result, index) =>
-        result.locale ? { ...result, locale: files[index].locale } : result
-      ),
-    };
-  }
-
   // -------------- Project Methods -------------- //
 
   /**
@@ -787,7 +770,7 @@ export class GT extends GTRuntime {
    * Reads metadata of source files and translations, in batches the server
    * accepts. A selector without `locale` reads the source file.
    *
-   * @param files - Selectors; an exact repeat is rejected.
+   * @param files - Selectors; ones that resolve to the same file, version, and locale are sent once and each gets the shared result.
    * @param options - Options for the API call.
    * @returns One result per selector, in selector order: `found`, `pending`, or `not_found`.
    */
@@ -798,9 +781,8 @@ export class GT extends GTRuntime {
     validateAuth('queryFiles', this._getTranslationConfig());
     const { results } = await this._getApiAdapter().queryFiles(files, options);
     return {
-      results: results.map((result, index) => ({
+      results: results.map((result) => ({
         ...result,
-        ...(result.locale && { locale: files[index].locale }),
         ...(result.sourceLocale && {
           sourceLocale: this.resolveServiceResponseLocale(result.sourceLocale),
         }),
@@ -945,7 +927,7 @@ export class GT extends GTRuntime {
    * Reads the decoded content of source files and translations, in batches the
    * server accepts. A selector without `locale` reads the source file.
    *
-   * @param files - Selectors; an exact repeat is rejected.
+   * @param files - Selectors; ones that resolve to the same file, version, and locale are sent once and each gets the shared result.
    * @param options - Options for the API call.
    * @returns One result per selector, in selector order: `ready`, `pending`, or `not_found`.
    */
@@ -954,7 +936,7 @@ export class GT extends GTRuntime {
     options: DownloadFileBatchOptions = {}
   ): Promise<QueryFilesContentResponse> {
     validateAuth('queryFilesContent', this._getTranslationConfig());
-    return await this._queryFilesContent(files, options);
+    return await this._getApiAdapter().queryFilesContent(files, options);
   }
 
   /**

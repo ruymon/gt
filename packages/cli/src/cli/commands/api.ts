@@ -225,7 +225,7 @@ function specFragment(
 }
 
 // Accepts an operationId, a spec path, or a concrete path such as
-// /v2/project/info/abc so agents can look up the request they are about to make.
+// /v2/projects/abc so agents can look up the request they are about to make.
 function findOperations(
   endpoint: string
 ): Record<string, Record<string, SpecOperation>> {

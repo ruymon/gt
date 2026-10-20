@@ -4,6 +4,7 @@ import { libraryDefaultLocale } from 'generaltranslation/internal';
 import type { SerializedDocument } from '../serialization/types';
 import type { ExistingTranslation } from './collectExistingTranslations';
 import { resolveFileName } from '../utils/fileNames';
+import { failedResultsDiagnostic } from '../utils/batchResults';
 
 /**
  * Upload translations that already exist in Sanity for previously serialized
@@ -31,7 +32,7 @@ export async function uploadTranslations(
 
   overrideConfig(secrets);
   const sourceLocale = gt.sourceLocale || libraryDefaultLocale;
-  return await api.uploadTranslations(
+  const uploadResult = await api.uploadTranslations(
     withTranslations.map(({ info, serializedDocument, translations }) => ({
       source: {
         content: serializedDocument.content,
@@ -49,7 +50,16 @@ export async function uploadTranslations(
         locale,
         versionId: info.versionId || undefined,
       })),
-    })),
-    { sourceLocale }
+    }))
   );
+  if (uploadResult.summary.failed > 0) {
+    console.warn(
+      failedResultsDiagnostic(
+        'Some existing translations could not be uploaded to General Translation',
+        uploadResult,
+        'Warning'
+      )
+    );
+  }
+  return uploadResult;
 }

@@ -14,9 +14,9 @@ import type { DownloadedVersionsV1 } from '../../fs/config/downloadedVersions.js
 // what gets written to the comparison file, which a mocked differ cannot see.
 vi.mock('../../utils/api.js', () => ({
   api: {
-    queryFileData: vi.fn(),
-    downloadFileBatch: vi.fn(),
-    submitUserEditDiffs: vi.fn(),
+    queryFiles: vi.fn(),
+    queryFilesContent: vi.fn(),
+    overwriteTranslations: vi.fn(),
   },
 }));
 
@@ -30,6 +30,20 @@ const TRANSLATION =
 const utf16leWithBom = (text: string) =>
   Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')]);
 
+/** Answers like the API: one saved result per diff, in request order. */
+function saveEveryDiff() {
+  vi.mocked(api.overwriteTranslations).mockImplementation(async (diffs) => ({
+    summary: { total: diffs.length, succeeded: diffs.length, failed: 0 },
+    results: diffs.map(({ branchId, fileId, versionId, locale }) => ({
+      branchId: branchId ?? '',
+      fileId,
+      versionId,
+      locale,
+      status: 'succeeded' as const,
+    })),
+  }));
+}
+
 describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () => {
   const originalCwd = process.cwd();
   let tempDir: string;
@@ -42,6 +56,7 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
     process.chdir(tempDir);
     vi.clearAllMocks();
     clearWarnings();
+    saveEveryDiff();
     warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
   });
 
@@ -116,9 +131,10 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
    * else — `.strings` included — arrives already decoded to a UTF-8 string.
    */
   const mockServerDownload = (data: string, fileFormat: string) => {
-    vi.mocked(api.queryFileData).mockResolvedValue({
-      translatedFiles: [
+    vi.mocked(api.queryFiles).mockResolvedValue({
+      results: [
         {
+          status: 'found',
           branchId: 'branch1',
           fileId: 'file1',
           versionId: 'version1',
@@ -127,9 +143,10 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
         },
       ],
     });
-    vi.mocked(api.downloadFileBatch).mockResolvedValue({
-      files: [
+    vi.mocked(api.queryFilesContent).mockResolvedValue({
+      results: [
         {
+          status: 'ready',
           branchId: 'branch1',
           fileId: 'file1',
           versionId: 'version1',
@@ -138,7 +155,7 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
           data,
         },
       ],
-    } as unknown as Awaited<ReturnType<typeof api.downloadFileBatch>>);
+    } as unknown as Awaited<ReturnType<typeof api.queryFilesContent>>);
   };
 
   const filesUnderTest = (fileFormat: string): FileReference[] => [
@@ -157,14 +174,14 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
     writeTranslation(Buffer.from(TRANSLATION, 'utf8'));
     mockServerDownload(TRANSLATION, 'DOT_STRINGS');
 
-    const hadDiffs = await collectAndSendUserEditDiffs(
+    const results = await collectAndSendUserEditDiffs(
       filesUnderTest('DOT_STRINGS'),
       settings
     );
 
-    expect(api.downloadFileBatch).toHaveBeenCalledTimes(1);
-    expect(api.submitUserEditDiffs).not.toHaveBeenCalled();
-    expect(hadDiffs).toBe(false);
+    expect(api.queryFilesContent).toHaveBeenCalledTimes(1);
+    expect(api.overwriteTranslations).not.toHaveBeenCalled();
+    expect(results).toEqual({ saved: [], failed: [] });
   });
 
   it('diffs an edited .strings translation against the decoded server text', async () => {
@@ -177,8 +194,8 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
 
     await collectAndSendUserEditDiffs(filesUnderTest('DOT_STRINGS'), settings);
 
-    expect(api.submitUserEditDiffs).toHaveBeenCalledTimes(1);
-    const [{ diffs }] = vi.mocked(api.submitUserEditDiffs).mock.calls[0];
+    expect(api.overwriteTranslations).toHaveBeenCalledTimes(1);
+    const [diffs] = vi.mocked(api.overwriteTranslations).mock.calls[0];
     expect(diffs).toHaveLength(1);
     expect(diffs[0].diff).toContain('-"welcome" = "¡Bienvenido!";');
     expect(diffs[0].diff).toContain('+"welcome" = "¡Hola!";');
@@ -195,8 +212,8 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
 
     await collectAndSendUserEditDiffs(filesUnderTest('DOT_STRINGS'), settings);
 
-    expect(api.submitUserEditDiffs).toHaveBeenCalledTimes(1);
-    const [{ diffs }] = vi.mocked(api.submitUserEditDiffs).mock.calls[0];
+    expect(api.overwriteTranslations).toHaveBeenCalledTimes(1);
+    const [diffs] = vi.mocked(api.overwriteTranslations).mock.calls[0];
     expect(diffs[0].diff).toContain('+"welcome" = "¡Bienvenido!";');
     expect(diffs[0].localContent).toBe(TRANSLATION);
   });
@@ -205,9 +222,10 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
     const settings = buildSettings();
     seedLockFile();
     writeTranslation(Buffer.from(TRANSLATION, 'utf8'));
-    vi.mocked(api.queryFileData).mockResolvedValue({
-      translatedFiles: [
+    vi.mocked(api.queryFiles).mockResolvedValue({
+      results: [
         {
+          status: 'found',
           branchId: 'branch1',
           fileId: 'file1',
           versionId: 'version1',
@@ -216,14 +234,23 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
         },
       ],
     });
-    vi.mocked(api.downloadFileBatch).mockResolvedValue({
-      files: [],
-    } as unknown as Awaited<ReturnType<typeof api.downloadFileBatch>>);
+    vi.mocked(api.queryFilesContent).mockResolvedValue({
+      results: [
+        {
+          status: 'pending',
+          branchId: 'branch1',
+          fileId: 'file1',
+          versionId: 'version1',
+          locale: 'es',
+          data: null,
+        },
+      ],
+    } as unknown as Awaited<ReturnType<typeof api.queryFilesContent>>);
 
     await collectAndSendUserEditDiffs(filesUnderTest('DOT_STRINGS'), settings);
 
     // No baseline at all, so there is nothing to diff and nothing to report.
-    expect(api.submitUserEditDiffs).not.toHaveBeenCalled();
+    expect(api.overwriteTranslations).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
   });
 
@@ -239,8 +266,8 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
 
     // The local file decodes by its byte order mark, so a UTF-16 edit has a
     // faithful text form and travels upstream like any other.
-    expect(api.submitUserEditDiffs).toHaveBeenCalledTimes(1);
-    const [{ diffs }] = vi.mocked(api.submitUserEditDiffs).mock.calls[0];
+    expect(api.overwriteTranslations).toHaveBeenCalledTimes(1);
+    const [diffs] = vi.mocked(api.overwriteTranslations).mock.calls[0];
     expect(diffs[0].diff).toContain('-"welcome" = "¡Bienvenido!";');
     expect(diffs[0].diff).toContain('+"welcome" = "¡Hola!";');
     expect(diffs[0].diff).not.toContain('�');
@@ -259,7 +286,7 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
     // The file differs from the server byte for byte but not as text, and
     // re-encoding on download is what put it in UTF-16. Reporting that as a
     // user edit would flag every UTF-16 file on every run.
-    expect(api.submitUserEditDiffs).not.toHaveBeenCalled();
+    expect(api.overwriteTranslations).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
     expect(getWarnings()).toHaveLength(0);
   });
@@ -304,7 +331,7 @@ describe('collectAndSendUserEditDiffs - formats whose bytes are not UTF-8', () =
       settings
     );
 
-    expect(api.submitUserEditDiffs).not.toHaveBeenCalled();
+    expect(api.overwriteTranslations).not.toHaveBeenCalled();
     expect(getWarnings()).toContainEqual({
       category: 'skipped_file',
       fileName: 'anim/es/spinner.lottie',

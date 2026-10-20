@@ -63,13 +63,34 @@ export async function saveLocalEdits(settings: Settings): Promise<void> {
   const spinner = logger.createSpinner('dots');
   spinner.start('Saving local edits...');
 
-  const hadDiffs = await collectAndSendUserEditDiffs(uploads, settings);
-  spinner.stop(chalk.green('Local edits saved successfully'));
+  const { saved, failed } = await collectAndSendUserEditDiffs(
+    uploads,
+    settings
+  );
+  if (failed.length === 0) {
+    spinner.stop(chalk.green('Local edits saved successfully'));
+  } else if (saved.length === 0) {
+    spinner.stop(chalk.red('Local edits could not be saved'));
+  } else {
+    spinner.stop(
+      chalk.yellow(
+        `Saved ${saved.length} of ${saved.length + failed.length} local edits`
+      )
+    );
+  }
 
-  // Publish files to CDN if diffs were detected and publish config exists
-  if (hadDiffs) {
+  // Publish only the file versions whose edits were all saved, if publish config exists
+  const versionKey = (edit: { fileId: string; versionId: string }) =>
+    `${edit.fileId}:${edit.versionId}`;
+  const failedVersions = new Set(failed.map(versionKey));
+  const savedVersions = new Map(
+    saved
+      .filter((edit) => !failedVersions.has(versionKey(edit)))
+      .map((edit) => [versionKey(edit), edit])
+  );
+  if (savedVersions.size > 0) {
     await runPublishWorkflow(
-      fileRefs,
+      [...savedVersions.values()],
       publishMap,
       branchResult.currentBranch.id,
       settings

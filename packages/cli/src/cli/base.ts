@@ -97,7 +97,7 @@ import {
   getNeedsPostprocessing,
   clearDownloaded,
 } from '../state/recentDownloads.js';
-import { clearWarnings } from '../state/translateWarnings.js';
+import { clearWarnings, getWarnings } from '../state/translateWarnings.js';
 import { displayTranslateSummary } from '../console/displayTranslateSummary.js';
 import updateConfig from '../fs/config/updateConfig.js';
 import {
@@ -401,7 +401,16 @@ export class BaseCLI {
         if (!hasValidCredentials(settings) || !hasValidServiceLocales(settings))
           return exitSync(1);
         await saveLocalEdits(settings);
-        logger.endCommand('Saved local edits');
+        const failed = getWarnings().some((w) =>
+          w.category.startsWith('failed_')
+        );
+        displayTranslateSummary();
+        clearWarnings();
+        logger.endCommand(
+          failed
+            ? 'Some local edits could not be saved or published. See the warnings above.'
+            : 'Saved local edits'
+        );
       });
   }
 
@@ -478,8 +487,10 @@ export class BaseCLI {
       try {
         const settings = await generateSettings(options);
         if (!hasValidCredentials(settings)) return exitSync(1);
-        const [status] = await api.checkJobStatus([jobId]);
-        logger.info(status?.status ?? 'unknown');
+        const {
+          results: [job],
+        } = await api.queryJobs([jobId]);
+        logger.info(job.status);
       } catch (error) {
         return logErrorAndExit(
           createProjectCommandError(
@@ -692,6 +703,8 @@ export class BaseCLI {
       });
     }
     await handleStage(initOptions, settings, this.library, true);
+    displayTranslateSummary();
+    clearWarnings();
   }
 
   /**
@@ -1020,6 +1033,8 @@ export class BaseCLI {
 
     // Process all file types at once with a single call
     await upload(settings);
+    displayTranslateSummary();
+    clearWarnings();
   }
 
   /** Describes installed runtimes without changing historical package lookup. */

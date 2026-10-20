@@ -81,7 +81,7 @@ describe('translateSite', () => {
     await translateSite({ payload, gt, locales: ['es', 'fr'] });
 
     expect(gt.calls.uploadSourceFiles).toBe(1);
-    expect(gt.calls.enqueueFiles).toBe(1);
+    expect(gt.calls.translateFiles).toBe(1);
     expect(gt.calls.awaitJobs).toBe(1);
   });
 
@@ -99,6 +99,33 @@ describe('translateSite', () => {
     expect(deleted?.result.locales.es?.status).toBe('failed');
     for (const id of pageIds)
       expect((await readPage(id, 'es')).title).toBe('HOME');
+  });
+
+  it('fails only the document whose source GT did not save', async () => {
+    const extra = await createPage(payload);
+    const gt = new FakeGt();
+    gt.failSourceUploads.add(`pages/${extra.id}`);
+    const result = await translateSite({ payload, gt, locales: ['es'] });
+
+    const failed = result.documents.find(
+      (d) => 'id' in d.target && d.target.id === extra.id
+    );
+    expect(failed?.result).toEqual({
+      error: 'GT could not save the document: source upload failed',
+      locales: {
+        es: {
+          status: 'failed',
+          error: 'GT could not save the document: source upload failed',
+        },
+      },
+    });
+    expect((await readPage(extra.id, 'es')).title ?? null).toBeNull();
+    expect(
+      result.documents.filter((d) => d.result.locales.es?.status === 'applied')
+    ).toHaveLength(6);
+    for (const id of pageIds)
+      expect((await readPage(id, 'es')).title).toBe('HOME');
+    await payload.delete({ collection: 'pages', id: extra.id });
   });
 
   it('with saveLocalEdits, sends edits for every document in one call', async () => {

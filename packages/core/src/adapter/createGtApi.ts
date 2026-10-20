@@ -511,25 +511,27 @@ export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
     files: QueryFilesData['body']['files'],
     options: { timeout?: number } = {}
   ) {
-    const results = await processBatches(files, async (batch) => {
-      const response = unwrapApiResult(
-        await queryFiles({
-          ...projectRequest(options.timeout),
-          body: {
-            files: batch.map((file) =>
-              toFileSelector({
-                ...file,
-                locale: file.locale && resolveServiceLocale(file.locale),
-              })
-            ),
-          },
-        })
-      );
-      return response.results;
-    });
+    const results = await queryEachSelector(files, (distinct) =>
+      processBatches(distinct, async (batch) => {
+        const response = unwrapApiResult(
+          await queryFiles({
+            ...projectRequest(options.timeout),
+            body: {
+              files: batch.map((file) =>
+                toFileSelector({
+                  ...file,
+                  locale: file.locale && resolveServiceLocale(file.locale),
+                })
+              ),
+            },
+          })
+        );
+        return response.results;
+      })
+    );
     return {
       results: results.map((result) => ({
-        ...aliasLocale(result),
+        ...result,
         ...(result.sourceLocale && {
           sourceLocale: resolveAliasLocale(
             result.sourceLocale,
@@ -543,6 +545,42 @@ export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
         }),
       })),
     };
+  }
+
+  // Distinct requested locales can resolve to the same service locale, and the
+  // API rejects exact repeats: send each distinct wire selector once and give
+  // every request its result, in request order, under the locale it requested.
+  async function queryEachSelector<
+    Selector extends QueryFilesData['body']['files'][number],
+    Result extends { locale?: string },
+  >(
+    files: readonly Selector[],
+    query: (distinct: Selector[]) => Promise<Result[]>
+  ): Promise<Result[]> {
+    const positionByKey = new Map<string, number>();
+    const distinct: Selector[] = [];
+    const positions = files.map((file) => {
+      const key = JSON.stringify([
+        file.fileId,
+        file.branchId,
+        file.versionId,
+        file.locale && resolveServiceLocale(file.locale),
+      ]);
+      let position = positionByKey.get(key);
+      if (position === undefined) {
+        position = distinct.push(file) - 1;
+        positionByKey.set(key, position);
+      }
+      return position;
+    });
+    const results = await query(distinct);
+    return positions.map((position, index) => {
+      const result = results[position];
+      const { locale } = files[index];
+      return result.locale && locale
+        ? { ...result, locale }
+        : aliasLocale(result);
+    });
   }
 
   async function getFileStatusOperation(
@@ -579,25 +617,27 @@ export function createGtApiAdapter(defaultConfig?: GtApiAdapterConfig) {
     files: QueryFilesContentData['body']['files'],
     options: { timeout?: number } = {}
   ) {
-    const results = await processBatches(files, async (batch) => {
-      const response = unwrapApiResult(
-        await queryFilesContent({
-          ...projectRequest(options.timeout),
-          body: {
-            files: batch.map((file) =>
-              toFileSelector({
-                ...file,
-                locale: file.locale && resolveServiceLocale(file.locale),
-              })
-            ),
-          },
-        })
-      );
-      return response.results;
-    });
+    const results = await queryEachSelector(files, (distinct) =>
+      processBatches(distinct, async (batch) => {
+        const response = unwrapApiResult(
+          await queryFilesContent({
+            ...projectRequest(options.timeout),
+            body: {
+              files: batch.map((file) =>
+                toFileSelector({
+                  ...file,
+                  locale: file.locale && resolveServiceLocale(file.locale),
+                })
+              ),
+            },
+          })
+        );
+        return response.results;
+      })
+    );
     return {
       results: results.map((result) => ({
-        ...aliasLocale(result),
+        ...result,
         ...(typeof result.data === 'string' && {
           data: decodeFileContent(result.data, result.fileFormat),
         }),

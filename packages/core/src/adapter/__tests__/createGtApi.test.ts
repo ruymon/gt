@@ -530,24 +530,55 @@ describe.sequential('createGtApiAdapter', () => {
     });
   });
 
-  it('keeps exact repeated selectors on the canonical reads for the API to reject', async () => {
-    vi.mocked(queryFiles).mockResolvedValue(result({ results: [] }));
-    vi.mocked(queryFilesContent).mockResolvedValue(result({ results: [] }));
+  it('sends canonical read selectors that normalize alike once and answers every position in order', async () => {
+    const metadata = {
+      status: 'found' as const,
+      fileId: 'file-id',
+      locale: 'es-ES',
+    };
+    const content = {
+      status: 'ready' as const,
+      fileId: 'file-id',
+      locale: 'es-ES',
+      data: Buffer.from('{}').toString('base64'),
+      fileFormat: 'JSON' as const,
+    };
+    const other = { status: 'not_found' as const, fileId: 'other-id' };
+    vi.mocked(queryFiles).mockResolvedValue(
+      result({ results: [metadata, other] })
+    );
+    vi.mocked(queryFilesContent).mockResolvedValue(
+      result({ results: [content, other] })
+    );
     const adapter = configuredAdapter();
+    // The alias `target` and the canonical `es-es` both resolve to `es-ES`.
     const files = [
       { fileId: 'file-id', locale: 'target' },
+      { fileId: 'other-id' },
       { fileId: 'file-id', locale: 'es-es' },
     ];
 
-    await adapter.queryFiles(files);
-    await adapter.queryFilesContent(files);
+    const queried = await adapter.queryFiles(files);
+    const downloaded = await adapter.queryFilesContent(files);
 
     const wire = [
       { fileId: 'file-id', locale: 'es-ES' },
-      { fileId: 'file-id', locale: 'es-ES' },
+      { fileId: 'other-id' },
     ];
     expect(bodyOf(queryFiles)).toEqual({ files: wire });
     expect(bodyOf(queryFilesContent)).toEqual({ files: wire });
+    // Each position gets back the locale it requested.
+    expect(queried.results).toEqual([
+      { ...metadata, locale: 'target' },
+      other,
+      { ...metadata, locale: 'es-es' },
+    ]);
+    const ready = { ...content, data: '{}' };
+    expect(downloaded.results).toEqual([
+      { ...ready, locale: 'target' },
+      other,
+      { ...ready, locale: 'es-es' },
+    ]);
   });
 
   it('takes the font organization from config, else from the project once per configuration', async () => {
@@ -1011,8 +1042,18 @@ describe.sequential('createGtApiAdapter', () => {
       },
     });
     vi.mocked(publishFiles).mockResolvedValue(result(succeeded([])));
-    vi.mocked(queryFiles).mockResolvedValue(result({ results: [] }));
-    vi.mocked(queryFilesContent).mockResolvedValue(result({ results: [] }));
+    // Reads answer one result per selector, in selector order.
+    const notFound = ({ body }: { body: { files: { fileId: string }[] } }) =>
+      Promise.resolve(
+        result({
+          results: body.files.map(({ fileId }) => ({
+            status: 'not_found' as const,
+            fileId,
+          })),
+        })
+      ) as never;
+    vi.mocked(queryFiles).mockImplementation(notFound);
+    vi.mocked(queryFilesContent).mockImplementation(notFound);
     vi.mocked(translateFiles).mockResolvedValue(result({ jobs: [] }));
     vi.mocked(overwriteTranslations).mockResolvedValue(result(succeeded([])));
     vi.mocked(uploadSourceFiles).mockResolvedValue(result(succeeded([])));

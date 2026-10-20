@@ -1,7 +1,4 @@
-import type {
-  ApiClientConfig,
-  GetFileStatusData,
-} from 'generaltranslation/api';
+import type { ApiClientConfig } from 'generaltranslation/api';
 import {
   createGtApiAdapter,
   defaultBaseUrl,
@@ -23,14 +20,4 @@ export function configureApiClient(
   configureSharedApi({ baseUrl: defaultBaseUrl, ...config });
 }
 
-export const api = {
-  ...sharedApi,
-
-  async querySourceFile(
-    query: Pick<GetFileStatusData['path'], 'fileId'> &
-      NonNullable<GetFileStatusData['query']>
-  ) {
-    const { fileId, ...queryParams } = query;
-    return sharedApi.querySourceFile({ fileId }, queryParams);
-  },
-};
+export const api = sharedApi;

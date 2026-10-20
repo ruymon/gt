@@ -412,6 +412,42 @@ describe.sequential('GT canonical API methods', () => {
     }
   );
 
+  it('queryFiles and queryFilesContent send selectors that normalize alike once and answer each with its requested locale', async () => {
+    const warningsBefore = warn.mock.calls.length;
+    const files = [
+      { fileId: 'f', locale: 'es' },
+      { fileId: 'f', locale: 'ES' },
+    ];
+
+    await expect(gt.queryFilesContent(files)).resolves.toEqual({
+      results: [
+        { ...decodedContent, metadata: undefined, status: 'ready' },
+        {
+          ...decodedContent,
+          metadata: undefined,
+          status: 'ready',
+          locale: 'ES',
+        },
+      ],
+    });
+    const contentQuery = requests.findLast((request) =>
+      request.url.endsWith('/files/content/query')
+    );
+    expect(await contentQuery!.json()).toEqual({
+      files: [{ fileId: 'f', locale: 'es' }],
+    });
+
+    const { results } = await gt.queryFiles(files);
+    expect(results).toHaveLength(2);
+    const fileQuery = requests.findLast((request) =>
+      request.url.endsWith('/files/query')
+    );
+    expect(await fileQuery!.json()).toEqual({
+      files: [{ fileId: 'f', locale: 'es' }],
+    });
+    expect(warn.mock.calls.length).toBe(warningsBefore);
+  });
+
   it('sends the deprecated createBranch input to the legacy route and warns once per field', async () => {
     const legacyQuery = { branchName: 'main', defaultBranch: true };
     await expect(gt.createBranch(legacyQuery)).resolves.toEqual({

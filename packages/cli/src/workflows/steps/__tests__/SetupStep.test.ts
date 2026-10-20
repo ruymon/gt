@@ -16,7 +16,7 @@ vi.mock('../../../console/logger.js', () => ({
 
 describe('SetupStep', () => {
   const gt = {
-    setupProject: vi.fn(),
+    generateProjectContext: vi.fn(),
     awaitJobs: vi.fn(),
   };
 
@@ -36,19 +36,20 @@ describe('SetupStep', () => {
     vi.clearAllMocks();
   });
 
-  it.each([
-    ['an unexpected status', { status: 'unknown' }],
-    ['a queued response without a job ID', { status: 'queued' }],
-  ])('does not poll for %s', async (_description, setupResult) => {
-    gt.setupProject.mockResolvedValue(setupResult);
+  it('does not poll when the project context is already current', async () => {
+    gt.generateProjectContext.mockResolvedValue({ job: null });
     const step = new SetupStep(gt, settings, 1_000);
 
     const result = await step.run(files);
 
     expect(result).toBe(files);
+    expect(gt.generateProjectContext).toHaveBeenCalledWith(files, {
+      locales: ['es'],
+      force: false,
+    });
     expect(gt.awaitJobs).not.toHaveBeenCalled();
     expect(spinner.stop).toHaveBeenCalledWith(
-      expect.stringContaining('Setup status unknown')
+      expect.stringContaining('Setup successfully completed')
     );
   });
 
@@ -83,9 +84,8 @@ describe('SetupStep', () => {
       'Setup timed out',
     ],
   ])('reports %s', async (_description, awaitResult, expectedMessage) => {
-    gt.setupProject.mockResolvedValue({
-      status: 'queued',
-      setupJobId: 'setup-job',
+    gt.generateProjectContext.mockResolvedValue({
+      job: { id: 'setup-job', status: 'queued' },
     });
     gt.awaitJobs.mockResolvedValue(awaitResult);
     const step = new SetupStep(gt, settings, 1_000);
